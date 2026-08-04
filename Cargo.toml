@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "vortice-proto",
+    "vortice-interop",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "LGPL-2.1-only"
+authors = ["Advanced Software Production Line, S.L."]
+repository = "https://github.com/ASPLes/vortice"
+homepage = "https://github.com/ASPLes/vortice"
+
+[workspace.dependencies]
+bytes = { version = "1", default-features = false }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+doc_markdown = "warn"
+todo = "warn"
