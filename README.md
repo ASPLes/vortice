@@ -15,7 +15,7 @@ Production Line (ASPL) maintainers of [LibVortex 1.1](https://github.com/ASPLes/
 
 | Crate | Contents |
 |---|---|
-| `vortice-proto` | Sans-IO core: BEEP framing, greetings. `no_std` + `alloc`, no `unsafe` |
+| `vortice-proto` | Sans-IO core: framing, greetings, channel management, flow control and the session state machine. `no_std` + `alloc`, no `unsafe` |
 | `vortice-interop` | Test harness driving the LibVortex regression suite. Not published |
 
 More crates are added as their phase in the development plan arrives.

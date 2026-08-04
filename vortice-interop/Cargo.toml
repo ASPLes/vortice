@@ -1,0 +1,16 @@
+[package]
+name = "vortice-interop"
+description = "Test harness driving the LibVortex 1.1 regression suite against Vortice"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
