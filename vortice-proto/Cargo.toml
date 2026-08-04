@@ -1,0 +1,21 @@
+[package]
+name = "vortice-proto"
+description = "Sans-IO core of Vortice: BEEP (RFC3080/RFC3081) framing and session state machine"
+keywords = ["beep", "rfc3080", "rfc3081", "protocol", "sans-io"]
+categories = ["network-programming", "no-std"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

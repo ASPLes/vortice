@@ -1,0 +1,54 @@
+[package]
+name = "vortice-proto-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "LGPL-2.1-only"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached from the main workspace: cargo-fuzz builds with its own flags and a nightly
+# toolchain, and must not drag those into a normal `cargo build` at the root.
+[workspace]
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+libfuzzer-sys = "0.4"
+vortice-proto = { path = ".." }
+
+[[bin]]
+name = "decode_frames"
+path = "fuzz_targets/decode_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_fragmented"
+path = "fuzz_targets/decode_fragmented.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_greeting"
+path = "fuzz_targets/parse_greeting.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_management"
+path = "fuzz_targets/parse_management.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_input"
+path = "fuzz_targets/session_input.rs"
+test = false
+doc = false
+bench = false
