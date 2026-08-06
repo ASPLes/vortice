@@ -11,12 +11,23 @@
 //! Without it the tests report themselves as skipped rather than failing, so that a
 //! developer without a LibVortex checkout is not blocked. CI must set the variable.
 
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
 use vortice_interop::{InteropError, LibVortex};
 
+/// Serialises the tests in this binary: the regression listener binds fixed ports, so two
+/// of these running at once would fight over 44010.
+fn exclusive() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let lock = LOCK.get_or_init(|| Mutex::new(()));
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Returns the suite, or `None` after printing why the test is being skipped.
-fn suite() -> Option<LibVortex> {
+fn suite() -> Option<(MutexGuard<'static, ()>, LibVortex)> {
+    let guard = exclusive();
     match LibVortex::from_env() {
-        Some(suite) if suite.is_built() => Some(suite),
+        Some(suite) if suite.is_built() => Some((guard, suite)),
         Some(suite) => {
             eprintln!(
                 "SKIPPED: {} does not contain the regression binaries; build LibVortex first",
@@ -33,7 +44,9 @@ fn suite() -> Option<LibVortex> {
 
 #[test]
 fn runs_the_c_client_against_the_c_listener() {
-    let Some(suite) = suite() else { return };
+    let Some((_guard, suite)) = suite() else {
+        return;
+    };
     let _listener = suite.start_listener().expect("listener should start");
 
     let run = suite
@@ -46,7 +59,9 @@ fn runs_the_c_client_against_the_c_listener() {
 
 #[test]
 fn detects_a_test_name_the_suite_silently_ignores() {
-    let Some(suite) = suite() else { return };
+    let Some((_guard, suite)) = suite() else {
+        return;
+    };
     let _listener = suite.start_listener().expect("listener should start");
 
     // The suite matches nothing, runs nothing and still prints "All test ok!". The harness
@@ -66,7 +81,9 @@ fn detects_a_test_name_the_suite_silently_ignores() {
 
 #[test]
 fn releases_the_listener_port_when_dropped() {
-    let Some(suite) = suite() else { return };
+    let Some((_guard, suite)) = suite() else {
+        return;
+    };
     drop(suite.start_listener().expect("listener should start"));
     // Starting again would fail with the port still held.
     let _listener = suite

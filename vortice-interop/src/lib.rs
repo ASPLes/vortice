@@ -63,8 +63,19 @@ use std::time::{Duration, Instant};
 /// Environment variable naming the LibVortex `test/` directory.
 pub const TEST_DIR_VAR: &str = "VORTICE_LIBVORTEX_TEST_DIR";
 
-/// Port the main regression listener binds, the target of almost every test.
+/// Base port the main regression listener binds, before any offset is applied.
 pub const MAIN_LISTENER_PORT: u16 = 44010;
+
+/// Environment variable overriding [`DEFAULT_PORT_OFFSET`].
+pub const PORT_OFFSET_VAR: &str = "VORTICE_LIBVORTEX_PORT_OFFSET";
+
+/// Offset added to every port the suite binds when nothing says otherwise.
+///
+/// It is deliberately not zero. The suite binds fixed ports, so a developer running it by
+/// hand in another terminal — or a listener left behind by an earlier run — would otherwise
+/// answer for the one these tests start, and the tests would silently exercise a process
+/// nobody is tracking. Shifting by default keeps the two apart without anyone remembering to.
+pub const DEFAULT_PORT_OFFSET: u16 = 1000;
 
 /// How long [`Listener::wait_ready`] waits for the listener to accept connections.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -91,6 +102,7 @@ const SUCCESS_LINE: &str = "All test ok!";
 #[derive(Debug, Clone)]
 pub struct LibVortex {
     test_dir: PathBuf,
+    port_offset: u16,
 }
 
 impl LibVortex {
@@ -98,7 +110,14 @@ impl LibVortex {
     #[must_use]
     pub fn from_env() -> Option<Self> {
         let test_dir = PathBuf::from(env::var_os(TEST_DIR_VAR)?);
-        Some(Self { test_dir })
+        let port_offset = env::var(PORT_OFFSET_VAR)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_PORT_OFFSET);
+        Some(Self {
+            test_dir,
+            port_offset,
+        })
     }
 
     /// Uses an explicit `test/` directory.
@@ -106,7 +125,27 @@ impl LibVortex {
     pub fn at(test_dir: impl Into<PathBuf>) -> Self {
         Self {
             test_dir: test_dir.into(),
+            port_offset: DEFAULT_PORT_OFFSET,
         }
+    }
+
+    /// Uses a specific port offset instead of [`DEFAULT_PORT_OFFSET`].
+    #[must_use]
+    pub const fn with_port_offset(mut self, offset: u16) -> Self {
+        self.port_offset = offset;
+        self
+    }
+
+    /// The offset added to every port the suite binds.
+    #[must_use]
+    pub const fn port_offset(&self) -> u16 {
+        self.port_offset
+    }
+
+    /// The port the main listener will bind, offset included.
+    #[must_use]
+    pub const fn listener_port(&self) -> u16 {
+        MAIN_LISTENER_PORT + self.port_offset
     }
 
     /// The `test/` directory in use.
@@ -141,7 +180,8 @@ impl LibVortex {
     /// # Errors
     ///
     /// Fails when the binary is missing, cannot be spawned, or does not accept a connection
-    /// within [`READY_TIMEOUT`].
+    /// within [`READY_TIMEOUT`]. Fails too when [`MAIN_LISTENER_PORT`] is already taken:
+    /// see [`LibVortex::port_is_free`] for why that matters more than it looks.
     pub fn start_listener(&self) -> io::Result<Listener> {
         let binary = self.listener_binary();
         if !binary.is_file() {
@@ -150,15 +190,42 @@ impl LibVortex {
                 format!("{} not found; build LibVortex first", binary.display()),
             ));
         }
+        let port = self.listener_port();
+        if !Self::port_is_free(port) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "port {port} is already taken; a stray vortex-regression-listener would \
+                     silently answer for the one started here. Set {PORT_OFFSET_VAR} to move \
+                     this run out of the way"
+                ),
+            ));
+        }
         let child = Command::new(&binary)
+            .arg(format!("--offset-port={}", self.port_offset))
             .current_dir(&self.test_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
         let mut listener = Listener { child };
-        listener.wait_ready(MAIN_LISTENER_PORT, READY_TIMEOUT)?;
+        listener.wait_ready(port, READY_TIMEOUT)?;
         Ok(listener)
+    }
+
+    /// Whether nothing is currently listening on `port`.
+    ///
+    /// [`Listener::wait_ready`] cannot tell the listener it started from one that was
+    /// already running: it polls until *something* accepts on the port. A stray listener
+    /// left behind by an earlier run therefore answers for the one just spawned, which dies
+    /// on a bind error, and every test then runs against a process nobody is tracking — with
+    /// whatever build of LibVortex it happened to load when it started. That is not
+    /// hypothetical: it is exactly what a listener left over from a previous session did
+    /// here, quietly serving several supposedly clean runs. Checking the port beforehand
+    /// turns that into an immediate, legible failure.
+    #[must_use]
+    pub fn port_is_free(port: u16) -> bool {
+        std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).is_ok()
     }
 
     /// Runs `vortex-regression-client`, restricted to `tests` when it is not empty.
@@ -181,6 +248,9 @@ impl LibVortex {
         }
         let mut command = Command::new(&binary);
         command.current_dir(&self.test_dir);
+        // The suite matches its options in a fixed order, with --offset-port first, so it
+        // has to be passed before --run-test rather than after.
+        command.arg(format!("--offset-port={}", self.port_offset));
         if !tests.is_empty() {
             command.arg(format!("--run-test={}", tests.join(",")));
         }
