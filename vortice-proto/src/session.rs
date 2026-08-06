@@ -220,6 +220,10 @@ pub struct Session {
     channels: BTreeMap<u32, Channel>,
     queues: BTreeMap<u32, VecDeque<Queued>>,
     pending: BTreeMap<u32, Pending>,
+    /// Message numbers received on each channel, in arrival order, still awaiting a reply.
+    reply_order: BTreeMap<u32, VecDeque<u32>>,
+    /// Replies produced before their turn, by channel and then by message number.
+    held_replies: BTreeMap<u32, BTreeMap<u32, VecDeque<Queued>>>,
     half_open: BTreeMap<u32, Profile>,
     unacked: BTreeMap<u32, u32>,
 
@@ -243,6 +247,8 @@ impl Session {
             channels: BTreeMap::new(),
             queues: BTreeMap::new(),
             pending: BTreeMap::new(),
+            reply_order: BTreeMap::new(),
+            held_replies: BTreeMap::new(),
             half_open: BTreeMap::new(),
             unacked: BTreeMap::new(),
             outbound: BytesMut::new(),
@@ -356,6 +362,15 @@ impl Session {
         let complete = channel.accept(frame)?;
         self.acknowledge(number, frame.size())?;
         if let Some(message) = complete {
+            if message.kind == FrameKind::Msg {
+                // Replies have to leave in the order the messages arrived, so the order is
+                // recorded here rather than inferred from the message numbers, which say
+                // nothing about arrival.
+                self.reply_order
+                    .entry(number)
+                    .or_default()
+                    .push_back(message.msgno);
+            }
             self.events.push_back(Event::MessageReceived {
                 channel: number,
                 message,
@@ -568,8 +583,88 @@ impl Session {
         if !self.channels.contains_key(&channel) {
             return Err(Error::NoSuchChannel { channel });
         }
+        if is_reply(kind) && !self.is_next_reply(channel, msgno) {
+            // Not this message's turn yet. RFC3080 requires replies on a channel to leave in
+            // the order the messages arrived, and a peer with ordered delivery enabled will
+            // sit waiting for the one it expects rather than accept a later one. Hold it.
+            self.held_replies
+                .entry(channel)
+                .or_default()
+                .entry(msgno)
+                .or_default()
+                .push_back(Queued {
+                    kind,
+                    msgno,
+                    ansno,
+                    payload,
+                });
+            return Ok(());
+        }
         self.enqueue(channel, kind, msgno, ansno, payload);
-        self.flush(channel)
+        self.flush(channel)?;
+        if completes_reply(kind) {
+            self.reply_finished(channel, msgno)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a reply for `msgno` may be written now.
+    ///
+    /// A channel with nothing recorded — a peer replying to a message this end never saw —
+    /// is left alone rather than blocked, since ordering only means anything relative to
+    /// messages actually received.
+    fn is_next_reply(&self, channel: u32, msgno: u32) -> bool {
+        self.reply_order
+            .get(&channel)
+            .and_then(VecDeque::front)
+            .is_none_or(|next| *next == msgno)
+    }
+
+    /// Retires a finished exchange and releases whatever was waiting behind it.
+    fn reply_finished(&mut self, channel: u32, msgno: u32) -> Result<(), Error> {
+        if let Some(order) = self.reply_order.get_mut(&channel)
+            && order.front() == Some(&msgno)
+        {
+            order.pop_front();
+        }
+
+        // Releasing one message can unblock the next, and so on down the queue.
+        loop {
+            let Some(next) = self
+                .reply_order
+                .get(&channel)
+                .and_then(VecDeque::front)
+                .copied()
+            else {
+                return Ok(());
+            };
+            let Some(held) = self
+                .held_replies
+                .get_mut(&channel)
+                .and_then(|channel_held| channel_held.remove(&next))
+            else {
+                return Ok(());
+            };
+
+            let mut finished = false;
+            for queued in held {
+                finished |= completes_reply(queued.kind);
+                self.enqueue(
+                    channel,
+                    queued.kind,
+                    queued.msgno,
+                    queued.ansno,
+                    queued.payload,
+                );
+            }
+            self.flush(channel)?;
+            if !finished {
+                return Ok(());
+            }
+            if let Some(order) = self.reply_order.get_mut(&channel) {
+                order.pop_front();
+            }
+        }
     }
 
     /// Sends a `MSG` on a channel, allocating a message number for it.
@@ -710,14 +805,33 @@ impl Session {
             self.channels.clear();
             self.queues.clear();
             self.unacked.clear();
+            self.reply_order.clear();
+            self.held_replies.clear();
             self.events.push_back(Event::SessionClosed);
             return;
         }
         self.channels.remove(&channel);
         self.queues.remove(&channel);
         self.unacked.remove(&channel);
+        self.reply_order.remove(&channel);
+        self.held_replies.remove(&channel);
         self.events.push_back(Event::ChannelClosed { channel });
     }
+}
+
+/// Whether a frame kind answers a message rather than starting an exchange.
+const fn is_reply(kind: FrameKind) -> bool {
+    matches!(
+        kind,
+        FrameKind::Rpy | FrameKind::Err | FrameKind::Ans | FrameKind::Nul
+    )
+}
+
+/// Whether a frame kind ends the exchange it belongs to.
+///
+/// `ANS` does not: a one-to-many reply runs until its `NUL`.
+const fn completes_reply(kind: FrameKind) -> bool {
+    matches!(kind, FrameKind::Rpy | FrameKind::Err | FrameKind::Nul)
 }
 
 /// Convenience for the common refusal: the profile is not supported.
