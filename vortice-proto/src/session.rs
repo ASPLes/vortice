@@ -215,6 +215,7 @@ pub struct Session {
     state: State,
     peer_greeting: Option<Greeting>,
 
+    inbound: BytesMut,
     zero: Channel,
     channels: BTreeMap<u32, Channel>,
     queues: BTreeMap<u32, VecDeque<Queued>>,
@@ -236,6 +237,7 @@ impl Session {
             next_channel: config.role.first_channel(),
             config,
             decoder: Decoder::new(),
+            inbound: BytesMut::new(),
             state: State::AwaitingGreeting,
             peer_greeting: None,
             channels: BTreeMap::new(),
@@ -304,11 +306,20 @@ impl Session {
     /// [`Decoder::decode`](crate::codec::Decoder::decode): LibVortex drops the connection in
     /// every one of these cases.
     pub fn handle_input(&mut self, input: &[u8]) -> Result<(), Error> {
-        let mut buf = BytesMut::from(input);
-        while let Some(frame) = self.decoder.decode(&mut buf)? {
+        // Octets that do not yet complete a frame are kept for the next call: a transport
+        // hands over whatever happened to arrive, and a frame straddling two reads must not
+        // lose its first half.
+        self.inbound.extend_from_slice(input);
+        while let Some(frame) = self.decoder.decode(&mut self.inbound)? {
             self.handle_frame(&frame)?;
         }
         Ok(())
+    }
+
+    /// Octets received but not yet forming a complete frame.
+    #[must_use]
+    pub fn buffered_input(&self) -> usize {
+        self.inbound.len()
     }
 
     fn handle_frame(&mut self, frame: &Frame) -> Result<(), Error> {
@@ -795,6 +806,32 @@ mod tests {
             );
             number
         }
+    }
+
+    #[test]
+    fn retains_input_that_does_not_yet_complete_a_frame() {
+        // A socket hands over whatever arrived. Feeding a session one octet at a time must
+        // deliver exactly what feeding it the whole buffer would: anything less means a
+        // frame straddling two reads loses its first half.
+        let mut listener = Session::new(Config::new(Role::Listener).with_profile(ECHO));
+        let initiator = Session::new(Config::new(Role::Initiator).with_profile(ECHO));
+
+        let mut wire = BytesMut::new();
+        let mut source = initiator;
+        while let Some(bytes) = source.poll_transmit() {
+            wire.extend_from_slice(&bytes);
+        }
+        assert!(
+            wire.len() > 8,
+            "the greeting should be more than a few octets"
+        );
+
+        for octet in wire.clone() {
+            listener.handle_input(&[octet]).unwrap();
+        }
+        assert_eq!(listener.state(), State::Ready);
+        assert!(listener.peer_greeting().unwrap().advertises(ECHO));
+        assert_eq!(listener.buffered_input(), 0);
     }
 
     #[test]

@@ -13,25 +13,28 @@
 //! invisible to callers: there is no "before the wrap" and "after the wrap" case to get
 //! wrong, because subtraction is always taken modulo 2³².
 //!
-//! # Divergence from LibVortex around the wrap point
+//! # The wrap point, and a bug it surfaced in LibVortex
 //!
-//! LibVortex advances its counters with `(counter + size) % MAX_SEQ_NO`, where `MAX_SEQ_NO`
-//! is 4294967295 — that is, modulo 2³² − 1. Since the counters are `unsigned int`, the
-//! addition has already wrapped modulo 2³² by the time the remainder is taken, so the
-//! remainder is a no-op for every value except exactly 4294967295, which it maps to 0.
+//! Writing this module surfaced a defect in the reference implementation, since fixed.
 //!
-//! The effect is that LibVortex never emits the sequence number 4294967295: if a frame
-//! boundary lands precisely on it, the counter jumps to 0 and everything afterwards is
-//! offset by one octet relative to a conformant peer, which then rejects the traffic as
-//! outside its window.
+//! LibVortex advanced its counters with `(counter + size) % MAX_SEQ_NO`, where `MAX_SEQ_NO`
+//! is 4294967295 — modulo 2³² − 1. Since the counters are `unsigned int`, the addition has
+//! already wrapped modulo 2³² by the time the remainder is taken, so the remainder was a
+//! no-op for every value except exactly 4294967295, which it mapped to 0.
 //!
-//! Vortice follows RFC3081 and wraps modulo 2³². The two agree everywhere except at that
-//! single value, and the header of the affected LibVortex code carries the constant that
-//! would make it agree — `MAX_SEQ_MOD`, defined as 4294967296 in `vortex_types.h` with a
-//! comment saying rotation should use it, and never referenced anywhere in the source. This
-//! looks like an oversight in the C rather than a deliberate choice, and it is being raised
-//! with the LibVortex maintainers; if it is instead confirmed as intended, this module is
-//! the single place that has to change.
+//! The effect was that LibVortex never emitted the sequence number 4294967295: if a frame
+//! boundary landed precisely on it, the counter jumped to 0 and everything afterwards sat
+//! one octet behind a conformant peer, which would then reject the traffic as outside its
+//! window. `vortex_types.h` already defined the right constant — `MAX_SEQ_MOD`, 4294967296,
+//! documented as the modulus rotation should use — and never referenced it anywhere.
+//!
+//! Four further sites used the same constant as a wrap *distance* rather than a modulus, and
+//! were each off by one or two octets in the branch that crosses the boundary. All ten sites
+//! now use `MAX_SEQ_MOD`, so Vortice and LibVortex agree with each other and with RFC3081.
+//!
+//! None of it needed a special case here: in modular arithmetic the wrapped and unwrapped
+//! branches the C writes by hand are the same expression, which is why [`Window::accepts`]
+//! has one line where `vortex_channel_check_incoming_seqno` has two.
 
 use crate::frame::MAX_FRAME_SIZE;
 
