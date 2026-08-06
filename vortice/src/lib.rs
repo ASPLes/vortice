@@ -40,12 +40,16 @@
 mod channel;
 mod connection;
 mod error;
+mod router;
+mod server;
 
 pub use channel::{Channel, Message, Reply};
 pub use connection::Connection;
 pub use error::{Error, Result};
+pub use router::{AlwaysRefuse, Handler, HandlerFuture, Responder, Router};
+pub use server::Server;
 
 pub use vortice_proto::frame::FrameKind;
 pub use vortice_proto::greeting::Greeting;
-pub use vortice_proto::management::{ErrorReply, Profile, code};
+pub use vortice_proto::management::{ErrorReply, Profile, Start, code};
 pub use vortice_proto::session::{Config, Role};

@@ -8,12 +8,12 @@
 //! that task over a channel. That is what makes the whole thing free of locks — no mutex
 //! guards a [`Session`], because only the driver ever touches one.
 //!
-//! # Known simplification
-//!
-//! Channels this end never asked for are refused with `550`, and closes the peer asks for
-//! are accepted, which is the BEEP default action. Serving profiles is phase F4.
+//! Channels the peer asks for are answered from the [`Router`] the session was given: a
+//! start offering a profile it serves is accepted, anything else is refused with `550`.
+//! Closes the peer asks for are accepted, which is the BEEP default action.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -21,12 +21,13 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, oneshot};
 use vortice_proto::frame::FrameKind;
 use vortice_proto::greeting::Greeting;
-use vortice_proto::management::{ErrorReply, Profile, code};
+use vortice_proto::management::{ErrorReply, Profile, Start, code};
 use vortice_proto::mime;
 use vortice_proto::session::{Config, Event, Session, State};
 
 use crate::channel::{Channel, Message, Reply};
 use crate::error::{Error, Result};
+use crate::router::{Handler, Responder, Router};
 
 /// How many octets are read from the transport at a time.
 const READ_CHUNK: usize = 16 * 1024;
@@ -103,6 +104,21 @@ impl Connection {
     where
         T: AsyncRead + AsyncWrite + Send + 'static,
     {
+        Self::serve_io(io, config, Router::new()).await
+    }
+
+    /// Runs a session that also serves the profiles in `router`.
+    ///
+    /// A channel the peer asks for is accepted when the router serves one of the profiles
+    /// offered, and refused otherwise.
+    ///
+    /// # Errors
+    ///
+    /// As [`Connection::connect`].
+    pub async fn serve_io<T>(io: T, config: Config, router: Router) -> Result<Self>
+    where
+        T: AsyncRead + AsyncWrite + Send + 'static,
+    {
         let (commands, receiver) = mpsc::channel(COMMAND_QUEUE);
         let (ready, greeted) = oneshot::channel();
 
@@ -114,6 +130,8 @@ impl Connection {
             commands: receiver,
             out: BytesMut::new(),
             routes: Routes::new(commands.downgrade()),
+            router: Arc::new(router),
+            served: HashMap::new(),
         };
         tokio::spawn(driver.run(ready));
 
@@ -128,6 +146,14 @@ impl Connection {
     #[must_use]
     pub const fn peer_greeting(&self) -> &Greeting {
         &self.peer_greeting
+    }
+
+    /// Resolves once the session has ended, however it ended.
+    ///
+    /// A server holds the handle open on this until the peer goes away; dropping it instead
+    /// would take the session down with it.
+    pub async fn closed(&self) {
+        self.commands.closed().await;
     }
 
     /// Asks the peer for a channel and waits for its answer.
@@ -241,6 +267,9 @@ struct Driver<T> {
     commands: mpsc::Receiver<Command>,
     out: BytesMut,
     routes: Routes,
+    router: Arc<Router>,
+    /// Handlers for the channels this end accepted, by channel number.
+    served: HashMap<u32, Arc<dyn Handler>>,
 }
 
 impl<T> Driver<T>
@@ -390,6 +419,29 @@ where
         }
     }
 
+    /// Answers a channel start by asking the router whether it serves anything offered.
+    fn start_requested(&mut self, channel: u32, msgno: u32, start: &Start) {
+        let Some((uri, handler)) = self.router.choose(start) else {
+            // 554 rather than 550: this is the code LibVortex reports when none of the
+            // profiles offered is registered, and the regression suite asserts on it.
+            let _ = self.session.refuse_start(
+                msgno,
+                ErrorReply::new(code::TRANSACTION_FAILED).with_text("profile not supported", None),
+            );
+            return;
+        };
+        match handler.accept(&uri, start) {
+            Ok(profile) => {
+                if self.session.accept_start(channel, msgno, profile).is_ok() {
+                    self.served.insert(channel, handler);
+                }
+            }
+            Err(error) => {
+                let _ = self.session.refuse_start(msgno, error);
+            }
+        }
+    }
+
     /// Turns one protocol event into whatever the handles are waiting for.
     fn handle_event(
         &mut self,
@@ -424,6 +476,7 @@ where
             }
             Event::ChannelClosed { channel } => {
                 self.routes.inbound.remove(&channel);
+                self.served.remove(&channel);
                 if let Some(reply) = self.routes.closes.remove(&channel) {
                     let _ = reply.send(Ok(()));
                 }
@@ -433,14 +486,11 @@ where
                     let _ = reply.send(Err(Error::Refused(error)));
                 }
             }
-            Event::StartRequested { msgno, .. } => {
-                // Serving profiles is phase F4; until then the polite answer is no.
-                let _ = self.session.refuse_start(
-                    msgno,
-                    ErrorReply::new(code::REQUESTED_ACTION_NOT_TAKEN)
-                        .with_text("this peer does not serve profiles", None),
-                );
-            }
+            Event::StartRequested {
+                channel,
+                msgno,
+                start,
+            } => self.start_requested(channel, msgno, &start),
             Event::CloseRequested { channel, msgno, .. } => {
                 // Accepting is the BEEP default action, which is what test_10 checks.
                 let _ = self.session.accept_close(channel, msgno);
@@ -482,6 +532,27 @@ where
                 }
                 FrameKind::Msg => unreachable!("guarded above"),
             }
+            return;
+        }
+
+        if message.kind == FrameKind::Msg
+            && let Some(handler) = self.served.get(&channel)
+            && let Some(commands) = self.routes.commands.upgrade()
+        {
+            let handler = Arc::clone(handler);
+            let delivered = Message {
+                kind: message.kind,
+                msgno: message.msgno,
+                ansno: message.ansno,
+                payload: body,
+            };
+            // Handlers run as their own task: a slow one must not hold up the session, and
+            // BEEP explicitly allows replying to several messages out of order.
+            tokio::spawn(async move {
+                handler
+                    .handle(Responder::new(channel, commands), delivered)
+                    .await;
+            });
             return;
         }
 
