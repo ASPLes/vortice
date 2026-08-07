@@ -44,7 +44,7 @@ mod router;
 mod server;
 
 pub use channel::{Channel, Message, Reply};
-pub use connection::Connection;
+pub use connection::{Connection, SessionId};
 pub use error::{Error, Result};
 pub use router::{AlwaysRefuse, Handler, HandlerFuture, Responder, Router};
 pub use server::Server;

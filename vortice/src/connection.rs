@@ -65,6 +65,32 @@ pub(crate) enum Command {
     CloseSession {
         reply: oneshot::Sender<Result<()>>,
     },
+    SetWindowSize {
+        channel: u32,
+        size: u32,
+        reply: oneshot::Sender<Result<()>>,
+    },
+}
+
+/// Distinguishes one session from another.
+///
+/// A [`Handler`] is shared by every session serving its profile, so anything it wants to
+/// remember per connection has to be keyed by this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionId(u64);
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl SessionId {
+    fn next() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 /// A BEEP session.
@@ -132,6 +158,7 @@ impl Connection {
             routes: Routes::new(commands.downgrade()),
             router: Arc::new(router),
             served: HashMap::new(),
+            id: SessionId::next(),
         };
         tokio::spawn(driver.run(ready));
 
@@ -270,6 +297,7 @@ struct Driver<T> {
     router: Arc<Router>,
     /// Handlers for the channels this end accepted, by channel number.
     served: HashMap<u32, Arc<dyn Handler>>,
+    id: SessionId,
 }
 
 impl<T> Driver<T>
@@ -402,6 +430,17 @@ where
                 let result = self
                     .session
                     .send(channel, kind, msgno, ansno, with_mime(&payload))
+                    .map_err(Error::from);
+                let _ = reply.send(result);
+            }
+            Command::SetWindowSize {
+                channel,
+                size,
+                reply,
+            } => {
+                let result = self
+                    .session
+                    .set_window_size(channel, size)
                     .map_err(Error::from);
                 let _ = reply.send(result);
             }
@@ -540,6 +579,7 @@ where
             && let Some(commands) = self.routes.commands.upgrade()
         {
             let handler = Arc::clone(handler);
+            let session = self.id;
             let delivered = Message {
                 kind: message.kind,
                 msgno: message.msgno,
@@ -550,7 +590,7 @@ where
             // BEEP explicitly allows replying to several messages out of order.
             tokio::spawn(async move {
                 handler
-                    .handle(Responder::new(channel, commands), delivered)
+                    .handle(Responder::new(session, channel, commands), delivered)
                     .await;
             });
             return;

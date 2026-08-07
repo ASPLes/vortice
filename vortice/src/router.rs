@@ -32,8 +32,8 @@ use tokio::sync::{mpsc, oneshot};
 use vortice_proto::frame::FrameKind;
 use vortice_proto::management::{ErrorReply, Profile, Start, code};
 
-use crate::channel::Message;
-use crate::connection::Command;
+use crate::channel::{Message, Reply};
+use crate::connection::{Command, SessionId};
 use crate::error::{Error, Result};
 
 /// What a handler returns: a task the session will drive to completion.
@@ -178,19 +178,52 @@ impl Router {
 /// what was meant.
 #[derive(Debug, Clone)]
 pub struct Responder {
+    session: SessionId,
     channel: u32,
     commands: mpsc::Sender<Command>,
 }
 
 impl Responder {
-    pub(crate) const fn new(channel: u32, commands: mpsc::Sender<Command>) -> Self {
-        Self { channel, commands }
+    pub(crate) const fn new(
+        session: SessionId,
+        channel: u32,
+        commands: mpsc::Sender<Command>,
+    ) -> Self {
+        Self {
+            session,
+            channel,
+            commands,
+        }
     }
 
     /// The channel this message arrived on.
     #[must_use]
     pub const fn channel(&self) -> u32 {
         self.channel
+    }
+
+    /// Which session this is, for a handler that keeps state per connection.
+    #[must_use]
+    pub const fn session(&self) -> SessionId {
+        self.session
+    }
+
+    /// Changes the window advertised for incoming traffic on this channel.
+    ///
+    /// # Errors
+    ///
+    /// As [`Responder::reply`].
+    pub async fn set_window_size(&self, size: u32) -> Result<()> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::SetWindowSize {
+                channel: self.channel,
+                size,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        answer.await.map_err(|_| Error::Closed)?
     }
 
     /// Answers positively, with an `RPY`.
@@ -213,12 +246,14 @@ impl Responder {
 
     /// Sends one answer of a one-to-many reply.
     ///
+    /// The answer number is allocated by the session, running from zero for each message
+    /// being answered, so a handler cannot get the sequence wrong.
+    ///
     /// # Errors
     ///
     /// As [`Responder::reply`].
-    pub async fn answer(&self, msgno: u32, ansno: u32, payload: impl Into<Bytes>) -> Result<()> {
-        self.send(FrameKind::Ans, msgno, Some(ansno), payload.into())
-            .await
+    pub async fn answer(&self, msgno: u32, payload: impl Into<Bytes>) -> Result<()> {
+        self.send(FrameKind::Ans, msgno, None, payload.into()).await
     }
 
     /// Ends a one-to-many reply, with a `NUL`.
@@ -228,6 +263,50 @@ impl Responder {
     /// As [`Responder::reply`].
     pub async fn finish(&self, msgno: u32) -> Result<()> {
         self.send(FrameKind::Nul, msgno, None, Bytes::new()).await
+    }
+
+    /// Sends a `MSG` of this end's own and waits for the peer to answer.
+    ///
+    /// A profile is not obliged to only answer: it may start exchanges of its own on the
+    /// channel, which is what the regression suite's `/3` profile does to check that a peer
+    /// may reply to several messages in any order it likes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Responder::reply`].
+    pub async fn request(&self, payload: impl Into<Bytes>) -> Result<Reply> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Request {
+                channel: self.channel,
+                payload: payload.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        answer.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Closes the channel this message arrived on.
+    ///
+    /// A profile that answers and then closes will often have its `<close>` cross the peer's
+    /// on the wire. That is legal and expected — BEEP calls it a close collision, and both
+    /// ends resolve it by accepting the one they receive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Refused`] if the peer declines to close, and [`Error::Closed`] when
+    /// the session ended first.
+    pub async fn close(&self) -> Result<()> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::CloseChannel {
+                number: self.channel,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        answer.await.map_err(|_| Error::Closed)?
     }
 
     async fn send(
