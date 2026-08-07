@@ -17,40 +17,18 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, MutexGuard};
-use vortice::{AlwaysRefuse, Config, Role, Router, Server, code};
+use vortice::{Config, Role, Server};
 use vortice_interop::LibVortex;
 
-/// The echo profile: reply with the same payload.
-const ECHO: &str = "http://iana.org/beep/transient/vortex-regression";
+#[path = "common/regression_profiles.rs"]
+mod regression_profiles;
 
-/// A second profile with an extended start handler, used for close-action checks.
-const ECHO_2: &str = "http://iana.org/beep/transient/vortex-regression/2";
-
-/// Advertised, but every channel start for it is refused.
-const DENY_SUPPORTED: &str = "http://iana.org/beep/transient/vortex-regression/deny_supported";
+use regression_profiles::regression_router;
 
 /// Serialises the tests in this binary; the suite binds fixed ports.
 async fn exclusive() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(())).lock().await
-}
-
-/// The subset of the regression listener contract these tests need.
-///
-/// Deliberately absent: the suite's `/deny` profile. `test_02` asks for it and requires the
-/// start to fail *because the profile is unknown*, which is a different code from a profile
-/// that is registered and refuses.
-fn regression_router() -> Router {
-    let echo = |responder: vortice::Responder, message: vortice::Message| async move {
-        let _ = responder.reply(message.msgno, message.payload).await;
-    };
-    Router::new()
-        .profile(ECHO, echo)
-        .profile(ECHO_2, echo)
-        .profile(
-            DENY_SUPPORTED,
-            AlwaysRefuse::with_text(code::SERVICE_NOT_AVAILABLE, "channel refused on purpose"),
-        )
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -77,6 +55,10 @@ async fn the_c_client_passes_its_tests_against_a_vortice_listener() {
         suite.listener_port()
     );
 
+    // The /5 profile serves files the request names, relative to the working directory, and
+    // the suite asks for files that live beside its binaries.
+    std::env::set_current_dir(suite.test_dir()).expect("the suite directory should exist");
+
     let server = Server::bind_with(
         ("0.0.0.0", suite.listener_port()),
         Config::new(Role::Listener),
@@ -89,7 +71,27 @@ async fn the_c_client_passes_its_tests_against_a_vortice_listener() {
     // Tier one of the certification order in the LibVortex map, minus the two that need
     // parts of the listener contract not built yet: test_09 wants close-in-transit, and
     // test_11 wants the suite's /3 profile, whose whole point is replying out of order.
-    let tests = ["test_01", "test_02", "test_03", "test_10"];
+    // The first tier of the certification order in the LibVortex map, plus the ANS/NUL
+    // family. Absent: test_02l, which needs a connection-accepted hook Vortice does not have.
+    //
+    // test_02m is the heavy one — 10000 answers of 4096 octets, about 40 MB — and it has
+    // been seen to fail on a machine busy compiling something else. If it fails in CI and
+    // nowhere else, suspect the load before the code.
+    let tests = [
+        "test_01",
+        "test_02",
+        "test_03",
+        "test_09",
+        "test_10",
+        "test_11",
+        "test_02k",
+        "test_02l1",
+        "test_02m",
+        "test_03b",
+        "test_03c",
+        "test_04a",
+        "test_04ab",
+    ];
     let run = tokio::time::timeout(
         Duration::from_secs(180),
         tokio::task::spawn_blocking(move || suite.run_client(&tests)),
