@@ -9,47 +9,22 @@
 //! conforms rather than merely that the client interoperates.
 //!
 //! ```sh
+//! cd ~/programas/libvortex-1.1/test          # the /5 profile serves files by name
 //! cargo run -p vortice --example regression-listener -- --offset-port=1000
-//! cd ~/programas/libvortex-1.1/test
-//! ./vortex-regression-client --offset-port=1000 --run-test=test_01,test_03,test_10
+//! ./vortex-regression-client --offset-port=1000 --run-test=test_01,test_11
 //! ```
 //!
-//! The profile set is the subset the first tier of the certification order needs. Note what
-//! is deliberately missing: the suite's `/deny` profile is *not* registered, because
-//! `test_02` requires a start for it to fail on the grounds that the profile is unknown.
+//! The profiles themselves live in the integration test's shared module, so this binary and
+//! CI serve exactly the same thing.
 
-use vortice::{AlwaysRefuse, Config, Message, Responder, Role, Router, Server, code};
+#[path = "../tests/common/regression_profiles.rs"]
+mod regression_profiles;
 
+use regression_profiles::regression_router;
+use vortice::{Config, Role, Server};
+
+/// Base port the suite's main listener uses, before any offset.
 const BASE_PORT: u16 = 44010;
-
-const ECHO: &str = "http://iana.org/beep/transient/vortex-regression";
-const ECHO_2: &str = "http://iana.org/beep/transient/vortex-regression/2";
-const ECHO_3: &str = "http://iana.org/beep/transient/vortex-regression/3";
-const DENY_SUPPORTED: &str = "http://iana.org/beep/transient/vortex-regression/deny_supported";
-
-/// The profiles this listener serves.
-#[must_use]
-pub fn regression_router() -> Router {
-    let echo = |responder: Responder, message: Message| async move {
-        if std::env::var_os("VORTICE_TRACE").is_some() {
-            eprintln!(
-                "[msg] channel={} msgno={} len={}",
-                responder.channel(),
-                message.msgno,
-                message.payload.len()
-            );
-        }
-        let _ = responder.reply(message.msgno, message.payload).await;
-    };
-    Router::new()
-        .profile(ECHO, echo)
-        .profile(ECHO_2, echo)
-        .profile(ECHO_3, echo)
-        .profile(
-            DENY_SUPPORTED,
-            AlwaysRefuse::with_text(code::SERVICE_NOT_AVAILABLE, "channel refused on purpose"),
-        )
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

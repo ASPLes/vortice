@@ -14,7 +14,7 @@ homepage.workspace = true
 [dependencies]
 bytes = { workspace = true, features = ["std"] }
 futures-core = "0.3"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
 tracing = "0.1"
 vortice-proto = { path = "../vortice-proto", version = "0.0.0" }
 
