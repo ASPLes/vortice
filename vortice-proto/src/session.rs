@@ -580,9 +580,20 @@ impl Session {
         ansno: Option<u32>,
         payload: Bytes,
     ) -> Result<(), Error> {
-        if !self.channels.contains_key(&channel) {
+        let Some(state) = self.channels.get_mut(&channel) else {
             return Err(Error::NoSuchChannel { channel });
-        }
+        };
+        // Answer numbers run from zero for each message being answered, so the caller does
+        // not have to track them: an ANS without one is given the next in sequence.
+        let ansno = match (kind, ansno) {
+            (FrameKind::Ans, None) => Some(state.allocate_ansno(msgno)),
+            (kind, ansno) => {
+                if kind == FrameKind::Nul {
+                    state.finish_answers(msgno);
+                }
+                ansno
+            }
+        };
         if is_reply(kind) && !self.is_next_reply(channel, msgno) {
             // Not this message's turn yet. RFC3080 requires replies on a channel to leave in
             // the order the messages arrived, and a peer with ordered delivery enabled will
@@ -665,6 +676,22 @@ impl Session {
                 order.pop_front();
             }
         }
+    }
+
+    /// Changes the window advertised for incoming traffic on a channel.
+    ///
+    /// This is `vortex_channel_set_window_size`, which the regression suite's
+    /// `/simple-ans-nul` profile drives from the wire.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NoSuchChannel`] when the channel is not open.
+    pub fn set_window_size(&mut self, channel: u32, size: u32) -> Result<(), Error> {
+        self.channels
+            .get_mut(&channel)
+            .ok_or(Error::NoSuchChannel { channel })?
+            .set_recv_window_size(size);
+        Ok(())
     }
 
     /// Sends a `MSG` on a channel, allocating a message number for it.
