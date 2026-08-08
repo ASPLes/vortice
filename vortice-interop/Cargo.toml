@@ -11,6 +11,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+bytes = { workspace = true, features = ["std"] }
+tokio = { version = "1", features = ["fs", "rt", "time"] }
+vortice = { path = "../vortice", version = "0.0.0" }
 
 [lints]
 workspace = true

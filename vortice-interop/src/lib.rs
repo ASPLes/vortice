@@ -60,11 +60,25 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+pub mod profiles;
+
 /// Environment variable naming the LibVortex `test/` directory.
 pub const TEST_DIR_VAR: &str = "VORTICE_LIBVORTEX_TEST_DIR";
 
 /// Base port the main regression listener binds, before any offset is applied.
 pub const MAIN_LISTENER_PORT: u16 = 44010;
+
+/// Base port the suite's WebSocket listener binds, before any offset is applied.
+///
+/// `test_17` opens its first connection here and then runs a whole run of ordinary tests
+/// over it, so a listener on this port has to serve the full profile contract.
+pub const WEBSOCKET_PORT: u16 = 44013;
+
+/// Base port the suite's port-sharing listener binds, before any offset is applied.
+///
+/// `test_20` expects one port to take plain BEEP, BEEP over WebSocket and BEEP over
+/// WebSocket over TLS, in that order.
+pub const SHARING_PORT: u16 = 44015;
 
 /// Environment variable overriding [`DEFAULT_PORT_OFFSET`].
 pub const PORT_OFFSET_VAR: &str = "VORTICE_LIBVORTEX_PORT_OFFSET";
@@ -146,6 +160,18 @@ impl LibVortex {
     #[must_use]
     pub const fn listener_port(&self) -> u16 {
         MAIN_LISTENER_PORT + self.port_offset
+    }
+
+    /// The port the suite's WebSocket listener will bind, offset included.
+    #[must_use]
+    pub const fn websocket_port(&self) -> u16 {
+        WEBSOCKET_PORT + self.port_offset
+    }
+
+    /// The port the suite's port-sharing listener will bind, offset included.
+    #[must_use]
+    pub const fn sharing_port(&self) -> u16 {
+        SHARING_PORT + self.port_offset
     }
 
     /// The `test/` directory in use.
