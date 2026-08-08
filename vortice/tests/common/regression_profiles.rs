@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use vortice::{AlwaysRefuse, Message, Responder, Router, SessionId, code};
+use vortice::{AlwaysRefuse, Handler, HandlerFuture, Message, Responder, Router, SessionId, code};
 
 const ECHO: &str = "http://iana.org/beep/transient/vortex-regression";
 const ECHO_2: &str = "http://iana.org/beep/transient/vortex-regression/2";
@@ -29,6 +29,39 @@ const CLOSE_IN_TRANSIT: &str = "http://iana.org/beep/transient/close-in-transit"
 
 /// Bulk one-to-many transfer: the request names how much to send.
 const BLOCKS: &str = "http://iana.org/beep/transient/vortex-regression/4";
+
+/// Pushes a message as soon as its channel opens, then takes the peer's one-to-many reply.
+const ANS_NUL_REPLY_CLOSE: &str =
+    "http://iana.org/beep/transient/vortex-regression/ans-nul-reply-close";
+
+/// Pushes two messages as soon as its channel opens.
+const FAST_SEND: &str = "http://iana.org/beep/transient/vortex-regression/fast-send";
+
+/// A profile whose whole behaviour is to push messages the moment its channel exists.
+///
+/// This is what LibVortex reaches through a connection-accepted hook installing a
+/// channel-added hook; here it is simply the profile's own [`Handler::on_open`].
+struct PushOnOpen {
+    messages: &'static [&'static str],
+}
+
+impl Handler for PushOnOpen {
+    fn handle(&self, _responder: Responder, _message: Message) -> HandlerFuture {
+        // The peer answers what was pushed; nothing arrives here unprompted.
+        Box::pin(std::future::ready(()))
+    }
+
+    fn on_open(&self, responder: Responder) -> HandlerFuture {
+        let messages = self.messages;
+        Box::pin(async move {
+            for message in messages {
+                if responder.request(*message).await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+}
 
 /// One-to-many transfer of a file the request names, relative to the working directory.
 const FILES: &str = "http://iana.org/beep/transient/vortex-regression/5";
@@ -87,6 +120,18 @@ pub fn regression_router() -> Router {
 
     Router::new()
         .profile(ECHO, echo)
+        .profile(
+            ANS_NUL_REPLY_CLOSE,
+            PushOnOpen {
+                messages: &["message 1"],
+            },
+        )
+        .profile(
+            FAST_SEND,
+            PushOnOpen {
+                messages: &["message 1", "message 2"],
+            },
+        )
         .profile(
             BLOCKS,
             |responder: Responder, message: Message| async move {

@@ -71,26 +71,28 @@ async fn the_c_client_passes_its_tests_against_a_vortice_listener() {
     // Tier one of the certification order in the LibVortex map, minus the two that need
     // parts of the listener contract not built yet: test_09 wants close-in-transit, and
     // test_11 wants the suite's /3 profile, whose whole point is replying out of order.
-    // The first tier of the certification order in the LibVortex map, plus the ANS/NUL
-    // family. Absent: test_02l, which needs a connection-accepted hook Vortice does not have.
+    // Tiers one and two of the certification order in the LibVortex map, plus the ANS/NUL
+    // family and the two profiles that push content the moment their channel opens.
     //
     // test_02m is the heavy one — 10000 answers of 4096 octets, about 40 MB — and it has
     // been seen to fail on a machine busy compiling something else. If it fails in CI and
     // nowhere else, suspect the load before the code.
     let tests = [
         "test_01",
+        "test_01c",
         "test_02",
-        "test_03",
-        "test_09",
-        "test_10",
-        "test_11",
         "test_02k",
+        "test_02l",
         "test_02l1",
         "test_02m",
+        "test_03",
         "test_03b",
         "test_03c",
         "test_04a",
         "test_04ab",
+        "test_09",
+        "test_10",
+        "test_11",
     ];
     let run = tokio::time::timeout(
         Duration::from_secs(180),
