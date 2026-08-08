@@ -16,7 +16,14 @@ Production Line (ASPL) maintainers of [LibVortex 1.1](https://github.com/ASPLes/
 | Crate | Contents |
 |---|---|
 | `vortice-proto` | Sans-IO core: framing, greetings, channel management, flow control and the session state machine. `no_std` + `alloc`, no `unsafe` |
+| `vortice` | Async sessions over tokio: client, server, profile router |
+| `vortice-http` | BEEP reached through an HTTP/1.1 upgrade, so it shares a port with an HTTP server |
 | `vortice-interop` | Test harness driving the LibVortex regression suite. Not published |
+
+`vortice` has one optional feature, `tower`, which lets a profile be served by a
+`tower::Service` so that any middleware written for tower — timeouts, retries, rate limits,
+tracing — applies to it unchanged. `vortice-http` has `axum`, which adds the `BeepUpgrade`
+extractor; without it the crate still works through `serve_upgraded`.
 
 More crates are added as their phase in the development plan arrives.
 
