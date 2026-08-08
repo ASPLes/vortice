@@ -43,6 +43,9 @@ mod error;
 mod router;
 mod server;
 
+#[cfg(feature = "tower")]
+pub mod service;
+
 pub use channel::{Channel, Message, Reply};
 pub use connection::{Connection, SessionId};
 pub use error::{Error, Result};

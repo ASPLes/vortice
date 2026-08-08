@@ -472,7 +472,11 @@ where
         match handler.accept(&uri, start) {
             Ok(profile) => {
                 if self.session.accept_start(channel, msgno, profile).is_ok() {
-                    self.served.insert(channel, handler);
+                    self.served.insert(channel, Arc::clone(&handler));
+                    if let Some(commands) = self.routes.commands.upgrade() {
+                        let responder = Responder::new(self.id, channel, commands);
+                        tokio::spawn(async move { handler.on_open(responder).await });
+                    }
                 }
             }
             Err(error) => {

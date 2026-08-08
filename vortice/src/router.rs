@@ -48,6 +48,17 @@ pub trait Handler: Send + Sync + 'static {
     /// Handles one message received on a channel of this profile.
     fn handle(&self, responder: Responder, message: Message) -> HandlerFuture;
 
+    /// Called once a channel of this profile has been accepted.
+    ///
+    /// The default does nothing. A profile that pushes content as soon as its channel exists
+    /// — rather than only answering what it is asked — implements this. The regression
+    /// suite has two such profiles, `/fast-send` and `/ans-nul-reply-close`, and LibVortex
+    /// reaches them through a connection-accepted hook that installs a channel-added hook;
+    /// hanging it off the profile itself says the same thing in one step.
+    fn on_open(&self, _responder: Responder) -> HandlerFuture {
+        Box::pin(core::future::ready(()))
+    }
+
     /// Decides whether to accept a channel start offering this profile.
     ///
     /// The default accepts, echoing the URI back with no piggybacked content. Returning an
@@ -146,6 +157,25 @@ impl Router {
     pub fn profile(mut self, uri: impl Into<String>, handler: impl Handler) -> Self {
         self.profiles.insert(uri.into(), Arc::new(handler));
         self
+    }
+
+    /// Serves `uri` with a [`tower::Service`].
+    ///
+    /// Everything tower offers applies: wrap the service in a `ServiceBuilder` and the
+    /// layers come with it. See [`crate::service`].
+    #[cfg(feature = "tower")]
+    #[must_use]
+    pub fn service<S>(self, uri: impl Into<String>, service: S) -> Self
+    where
+        S: tower::Service<crate::service::Request, Response = crate::service::Response>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        S::Future: Send,
+        S::Error: core::fmt::Display + Send,
+    {
+        self.profile(uri, crate::service::ServiceHandler::new(service))
     }
 
     /// Whether a profile URI is served.
