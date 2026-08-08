@@ -7,11 +7,10 @@
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use vortice::{Config, Connection};
+use vortice::{Config, Connection, Rewind};
 
 use crate::UPGRADE_TOKEN;
 use crate::error::{Error, Result};
-use crate::rewind::Rewind;
 
 /// Largest response head accepted, so a peer that never sends a blank line cannot make the
 /// client read for ever.

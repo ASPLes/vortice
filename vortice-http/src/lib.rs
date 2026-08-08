@@ -62,13 +62,13 @@
 
 mod client;
 mod error;
-mod rewind;
 mod server;
 
 pub use client::connect;
 pub use error::{Error, Result};
-pub use rewind::Rewind;
 pub use server::{is_beep_upgrade, serve_upgraded};
+#[doc(no_inline)]
+pub use vortice::Rewind;
 
 #[cfg(feature = "axum")]
 pub use server::BeepUpgrade;
