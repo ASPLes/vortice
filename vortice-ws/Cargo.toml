@@ -1,0 +1,27 @@
+[package]
+name = "vortice-ws"
+description = "BEEP over WebSocket (RFC6455): run Vortice through infrastructure that only passes web traffic"
+keywords = ["beep", "rfc3080", "websocket", "rfc6455"]
+categories = ["network-programming", "web-programming"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+bytes = { workspace = true, features = ["std"] }
+getrandom = "0.3"
+tokio = { version = "1", features = ["io-util", "net", "rt"] }
+tracing = "0.1"
+vortice = { path = "../vortice", version = "0.0.0" }
+vortice-proto = { path = "../vortice-proto", version = "0.0.0" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+vortice-interop = { path = "../vortice-interop" }
