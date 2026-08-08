@@ -17,11 +17,8 @@
 //! The profiles themselves live in the integration test's shared module, so this binary and
 //! CI serve exactly the same thing.
 
-#[path = "../tests/common/regression_profiles.rs"]
-mod regression_profiles;
-
-use regression_profiles::regression_router;
 use vortice::{Config, Role, Server};
+use vortice_interop::profiles::regression_router;
 
 /// Base port the suite's main listener uses, before any offset.
 const BASE_PORT: u16 = 44010;

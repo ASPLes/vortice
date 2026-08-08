@@ -20,10 +20,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use vortice::{Config, Role, Server};
 use vortice_interop::LibVortex;
 
-#[path = "common/regression_profiles.rs"]
-mod regression_profiles;
-
-use regression_profiles::regression_router;
+use vortice_interop::profiles::regression_router;
 
 /// Serialises the tests in this binary; the suite binds fixed ports.
 async fn exclusive() -> MutexGuard<'static, ()> {

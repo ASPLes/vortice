@@ -40,6 +40,7 @@
 mod channel;
 mod connection;
 mod error;
+mod rewind;
 mod router;
 mod server;
 
@@ -49,6 +50,7 @@ pub mod service;
 pub use channel::{Channel, Message, Reply};
 pub use connection::{Connection, SessionId};
 pub use error::{Error, Result};
+pub use rewind::Rewind;
 pub use router::{AlwaysRefuse, Handler, HandlerFuture, Responder, Router};
 pub use server::Server;
 
