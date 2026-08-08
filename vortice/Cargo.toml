@@ -15,11 +15,18 @@ homepage.workspace = true
 bytes = { workspace = true, features = ["std"] }
 futures-core = "0.3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
+tower = { version = "0.5", features = ["util"], optional = true }
 tracing = "0.1"
 vortice-proto = { path = "../vortice-proto", version = "0.0.0" }
 
+[features]
+default = []
+# Serve a profile with a tower::Service, so every tower middleware applies to it.
+tower = ["dep:tower"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+tower = { version = "0.5", features = ["util", "timeout"] }
 vortice-interop = { path = "../vortice-interop" }
 
 [lints]
