@@ -18,7 +18,12 @@ Production Line (ASPL) maintainers of [LibVortex 1.1](https://github.com/ASPLes/
 | `vortice-proto` | Sans-IO core: framing, greetings, channel management, flow control and the session state machine. `no_std` + `alloc`, no `unsafe` |
 | `vortice` | Async sessions over tokio: client, server, profile router |
 | `vortice-http` | BEEP reached through an HTTP/1.1 upgrade, so it shares a port with an HTTP server |
+| `vortice-ws` | BEEP over WebSocket (RFC6455), which reaches through infrastructure that only passes web traffic. Also shares a port with plain BEEP |
 | `vortice-interop` | Test harness driving the LibVortex regression suite. Not published |
+
+`vortice-ws` has no optional features and no WebSocket dependency: the binding needs to
+receive text frames without validating UTF-8, which is what LibVortex sends and what a
+conforming library refuses, so the framing is implemented here.
 
 `vortice` has one optional feature, `tower`, which lets a profile be served by a
 `tower::Service` so that any middleware written for tower — timeouts, retries, rate limits,
