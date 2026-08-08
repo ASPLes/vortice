@@ -1,0 +1,40 @@
+[package]
+name = "vortice-http"
+description = "BEEP over an HTTP/1.1 upgrade: run Vortice on the same port as an HTTP server"
+keywords = ["beep", "rfc3080", "http", "upgrade", "axum"]
+categories = ["network-programming", "web-programming"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+axum = { version = "0.8.9", optional = true }
+bytes = { workspace = true, features = ["std"] }
+http = "1.5.0"
+hyper = { version = "1.11.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+tokio = { version = "1", features = ["io-util", "net", "rt"] }
+vortice = { path = "../vortice", version = "0.0.0" }
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The axum extractor. Without it the crate still works through `serve_upgraded`, which is
+# all the extractor does underneath.
+axum = ["dep:axum"]
+
+[[example]]
+name = "axum-shared-port"
+required-features = ["axum"]
+
+[dev-dependencies]
+axum = "0.8.9"
+http-body-util = "0.1.4"
+hyper-util = "0.1.20"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
