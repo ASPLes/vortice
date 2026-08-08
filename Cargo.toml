@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "vortice",
+    "vortice-http",
     "vortice-proto",
     "vortice-interop",
 ]
