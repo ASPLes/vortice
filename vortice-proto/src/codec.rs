@@ -306,6 +306,44 @@ fn parse_continuation(field: &[u8]) -> Result<bool, Error> {
     }
 }
 
+/// The length of the complete BEEP frame at the front of `src`, if there is one.
+///
+/// Nothing is consumed and no payload is copied: this only measures. It answers `None` when
+/// `src` does not begin with a whole frame, whether because more octets are needed or
+/// because what is there is not a frame at all.
+///
+/// It exists for transports that have to align their own framing to BEEP's. A stream
+/// transport never needs this — TCP has no boundaries to align — but a message transport
+/// does, and [`vortice-ws`](https://docs.rs/vortice-ws) uses it to put exactly one BEEP
+/// frame in each WebSocket frame.
+///
+/// ```
+/// use vortice_proto::codec::frame_boundary;
+///
+/// let two = b"RPY 0 0 . 0 5\r\nhelloEND\r\nRPY 0 1 . 5 2\r\nhiEND\r\n";
+/// assert_eq!(frame_boundary(two), Some(25));
+/// assert_eq!(frame_boundary(b"SEQ 0 4096 4096\r\n"), Some(17));
+/// assert_eq!(frame_boundary(b"RPY 0 0 . 0 5\r\nhel"), None);
+/// ```
+#[must_use]
+pub fn frame_boundary(src: &[u8]) -> Option<usize> {
+    let window = src.len().min(MAX_HEADER_LEN);
+    let lf = find(&src[..window], b'\n')?;
+    if lf == 0 || src[lf - 1] != b'\r' {
+        return None;
+    }
+    let header_len = lf + 1;
+
+    match parse_header(&src[..lf - 1], MAX_FRAME_SIZE).ok()? {
+        // A SEQ frame is its header line and nothing else.
+        Parsed::Seq(_) => Some(header_len),
+        Parsed::Data(header) => {
+            let total = header_len + header.size as usize + TRAILER.len();
+            (src.len() >= total).then_some(total)
+        }
+    }
+}
+
 fn find(haystack: &[u8], needle: u8) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
 }
