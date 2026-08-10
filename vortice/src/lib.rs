@@ -48,7 +48,7 @@ mod server;
 pub mod service;
 
 pub use channel::{Channel, Message, Reply};
-pub use connection::{Connection, SessionId};
+pub use connection::{BoxedTransport, Connection, SessionId, Transport};
 pub use error::{Error, Result};
 pub use rewind::Rewind;
 pub use router::{AlwaysRefuse, Handler, HandlerFuture, Responder, Router};

@@ -13,6 +13,8 @@
 //! Closes the peer asks for are accepted, which is the BEEP default action.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -29,6 +31,27 @@ use crate::channel::{Channel, Message, Reply};
 use crate::error::{Error, Result};
 use crate::router::{Handler, Responder, Router};
 
+/// Anything that can carry a BEEP session.
+///
+/// A blanket implementation covers every `AsyncRead + AsyncWrite`, so this names a set rather
+/// than asking anything of a caller.
+pub trait Transport: AsyncRead + AsyncWrite + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Send> Transport for T {}
+
+/// A transport with its type erased, which is what makes swapping one possible.
+///
+/// TLS replaces a `TcpStream` with a stream of an entirely different type, so the driver
+/// cannot be generic over the transport if it is to outlive the swap. The indirection costs a
+/// virtual call per read and per write, which is nothing beside the syscall underneath.
+pub type BoxedTransport = Pin<Box<dyn Transport>>;
+
+/// Turns the transport of a live session into its replacement.
+type Swap = Box<
+    dyn FnOnce(BoxedTransport) -> Pin<Box<dyn Future<Output = Result<BoxedTransport>> + Send>>
+        + Send,
+>;
+
 /// How many octets are read from the transport at a time.
 const READ_CHUNK: usize = 16 * 1024;
 
@@ -39,7 +62,6 @@ const COMMAND_QUEUE: usize = 64;
 const INBOUND_QUEUE: usize = 64;
 
 /// A request from a handle to the driver.
-#[derive(Debug)]
 pub(crate) enum Command {
     OpenChannel {
         profile: Profile,
@@ -69,6 +91,18 @@ pub(crate) enum Command {
         channel: u32,
         size: u32,
         reply: oneshot::Sender<Result<()>>,
+    },
+    Upgrade {
+        /// Written and flushed before the transport is replaced.
+        ///
+        /// The TLS profile's `<proceed/>` has to go out *and* the transport has to be swapped
+        /// without the driver reading anything in between: the peer starts its handshake the
+        /// moment it sees the reply, and those octets fed to a BEEP parser would end the
+        /// session. Carrying the reply here is what makes the pair atomic.
+        last_reply: Option<(u32, u32, Bytes)>,
+        swap: Swap,
+        config: Config,
+        reply: oneshot::Sender<Result<Greeting>>,
     },
 }
 
@@ -148,16 +182,15 @@ impl Connection {
         let (commands, receiver) = mpsc::channel(COMMAND_QUEUE);
         let (ready, greeted) = oneshot::channel();
 
-        let (reader, writer) = tokio::io::split(io);
         let driver = Driver {
             session: Session::new(config),
-            reader,
-            writer,
+            io: Io::new(Box::pin(io)),
             commands: receiver,
             out: BytesMut::new(),
             routes: Routes::new(commands.downgrade()),
             router: Arc::new(router),
             served: HashMap::new(),
+            awaiting_upgrade: false,
             id: SessionId::next(),
         };
         tokio::spawn(driver.run(ready));
@@ -167,6 +200,34 @@ impl Connection {
             commands,
             peer_greeting,
         })
+    }
+
+    /// Replaces the transport and starts a new session over it.
+    ///
+    /// This is the whole extension point BEEP's TLS needs, and the only one the core exposes
+    /// for it: `vortice-tls` is written against this and nothing private. `swap` is handed the
+    /// live transport and returns its replacement — a TLS stream wrapping it, in practice.
+    ///
+    /// RFC3080 §3.1 is explicit that this is not a resumption. Both ends throw away everything
+    /// they knew and begin again with a greeting, so every [`Channel`] taken from this session
+    /// stops working and the returned greeting is a genuinely new one. That is why this takes
+    /// `&mut self`: the handle's own view of the peer is replaced too.
+    ///
+    /// For the listening side, use [`Responder::upgrade`](crate::Responder::upgrade), which
+    /// also sends the reply that tells the peer to begin.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever `swap` reports if the handshake fails — after which the session is
+    /// finished, because the old transport went with it — and [`Error::Closed`] if the session
+    /// ended first.
+    pub async fn upgrade<F, Fut>(&mut self, config: Config, swap: F) -> Result<&Greeting>
+    where
+        F: FnOnce(BoxedTransport) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<BoxedTransport>> + Send + 'static,
+    {
+        self.peer_greeting = upgrade_session(&self.commands, None, config, swap).await?;
+        Ok(&self.peer_greeting)
     }
 
     /// The greeting the peer sent, listing the profiles it is willing to serve.
@@ -268,6 +329,15 @@ impl Routes {
         }
     }
 
+    /// Drops everything belonging to the session that has just been replaced.
+    ///
+    /// Same job as [`Routes::shutdown`], and deliberately the same outcome for callers: an
+    /// upgrade ends the old session, so a handle that survived it is no longer good for
+    /// anything and should say so rather than wait.
+    fn reset(&mut self) {
+        self.shutdown();
+    }
+
     /// Completes everything still waiting, so no caller is left hanging when the session ends.
     fn shutdown(&mut self) {
         for (_, sender) in self.opens.drain() {
@@ -287,23 +357,78 @@ impl Routes {
 }
 
 /// The task that owns the protocol state machine.
-struct Driver<T> {
+/// Sends an upgrade command and waits for the new session's greeting.
+pub(crate) async fn upgrade_session<F, Fut>(
+    commands: &mpsc::Sender<Command>,
+    last_reply: Option<(u32, u32, Bytes)>,
+    config: Config,
+    swap: F,
+) -> Result<Greeting>
+where
+    F: FnOnce(BoxedTransport) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<BoxedTransport>> + Send + 'static,
+{
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(Command::Upgrade {
+            last_reply,
+            swap: Box::new(move |io| Box::pin(swap(io))),
+            config,
+            reply,
+        })
+        .await
+        .map_err(|_| Error::Closed)?;
+    answer.await.map_err(|_| Error::Closed)?
+}
+
+/// The two halves of the transport, kept together so a swap can reunite them.
+struct Io {
+    reader: ReadHalf<BoxedTransport>,
+    writer: WriteHalf<BoxedTransport>,
+}
+
+impl Io {
+    fn new(transport: BoxedTransport) -> Self {
+        let (reader, writer) = tokio::io::split(transport);
+        Self { reader, writer }
+    }
+
+    /// A transport that reads nothing and swallows what is written to it.
+    ///
+    /// Held for the instant between taking the real one out and putting its replacement back,
+    /// so the driver never has to make its transport an `Option` that every read unwraps.
+    fn placeholder() -> Self {
+        Self::new(Box::pin(tokio::io::join(
+            tokio::io::empty(),
+            tokio::io::sink(),
+        )))
+    }
+
+    fn reunite(self) -> BoxedTransport {
+        self.reader.unsplit(self.writer)
+    }
+}
+
+struct Driver {
     session: Session,
-    reader: ReadHalf<T>,
-    writer: WriteHalf<T>,
+    io: Io,
     commands: mpsc::Receiver<Command>,
     out: BytesMut,
     routes: Routes,
     router: Arc<Router>,
     /// Handlers for the channels this end accepted, by channel number.
     served: HashMap<u32, Arc<dyn Handler>>,
+    /// Set once a start was accepted for a profile that replaces the transport.
+    ///
+    /// While it is set the driver writes but does not read. The peer begins its handshake as
+    /// soon as it sees the reply, and those octets handed to a BEEP parser would end the
+    /// session, so the gap between accepting the start and the upgrade arriving has to be one
+    /// in which nothing is read. See [`Handler::upgrades_transport`].
+    awaiting_upgrade: bool,
     id: SessionId,
 }
 
-impl<T> Driver<T>
-where
-    T: AsyncRead + AsyncWrite + Send + 'static,
-{
+impl Driver {
     async fn run(mut self, ready: oneshot::Sender<Result<Greeting>>) {
         let mut ready = Some(ready);
         let outcome = self.pump(&mut ready).await;
@@ -346,13 +471,45 @@ where
             read.clear();
             read.reserve(READ_CHUNK);
 
+            if self.awaiting_upgrade {
+                // Write and take commands, but do not read: see the field's documentation.
+                if self.out.is_empty() {
+                    match self.commands.recv().await {
+                        Some(command) => self.dispatch(command, ready).await?,
+                        None => return Ok(()),
+                    }
+                } else {
+                    let written = {
+                        let writer = &mut self.io.writer;
+                        let commands = &mut self.commands;
+                        let out = &self.out;
+                        tokio::select! {
+                            command = commands.recv() => Progress::Command(command),
+                            result = writer.write(out) => Progress::Wrote(result?),
+                        }
+                    };
+                    match written {
+                        Progress::Command(Some(command)) => self.dispatch(command, ready).await?,
+                        Progress::Command(None) => return Ok(()),
+                        Progress::Wrote(n) => {
+                            self.out.advance(n);
+                            if self.out.is_empty() {
+                                self.io.writer.flush().await?;
+                            }
+                        }
+                        Progress::Read(_) => {}
+                    }
+                }
+                continue;
+            }
+
             if self.out.is_empty() {
                 tokio::select! {
                     command = self.commands.recv() => match command {
-                        Some(command) => self.apply(command),
+                        Some(command) => self.dispatch(command, ready).await?,
                         None => return Ok(()),
                     },
-                    result = self.reader.read_buf(&mut read) => {
+                    result = self.io.reader.read_buf(&mut read) => {
                         if result? == 0 {
                             return Ok(());
                         }
@@ -361,8 +518,8 @@ where
                 }
             } else {
                 let written = {
-                    let writer = &mut self.writer;
-                    let reader = &mut self.reader;
+                    let writer = &mut self.io.writer;
+                    let reader = &mut self.io.reader;
                     let commands = &mut self.commands;
                     let out = &self.out;
                     tokio::select! {
@@ -372,14 +529,95 @@ where
                     }
                 };
                 match written {
-                    Progress::Command(Some(command)) => self.apply(command),
+                    Progress::Command(Some(command)) => self.dispatch(command, ready).await?,
                     Progress::Command(None) => return Ok(()),
                     Progress::Read(0) => return Ok(()),
                     Progress::Read(_) => self.session.handle_input(&read)?,
-                    Progress::Wrote(n) => self.out.advance(n),
+                    Progress::Wrote(n) => {
+                        self.out.advance(n);
+                        if self.out.is_empty() {
+                            // Nothing more to write, so make sure it has actually gone. A
+                            // transport that buffers — TLS holds an encrypted record until it
+                            // is asked to emit it — would otherwise keep the last frame to
+                            // itself, and a 19 octet `SEQ` sitting in that buffer stalls the
+                            // peer's window with both ends waiting and both socket queues
+                            // empty. Over TCP this costs a syscall that does nothing.
+                            self.io.writer.flush().await?;
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// Carries out one request from a handle, including the one that has to await.
+    async fn dispatch(
+        &mut self,
+        command: Command,
+        ready: &mut Option<oneshot::Sender<Result<Greeting>>>,
+    ) -> Result<()> {
+        match command {
+            Command::Upgrade {
+                last_reply,
+                swap,
+                config,
+                reply,
+            } => self.upgrade(last_reply, swap, config, reply, ready).await,
+            other => {
+                self.apply(other);
+                Ok(())
+            }
+        }
+    }
+
+    /// Replaces the transport and starts a fresh session over it.
+    ///
+    /// RFC3080 §3.1 is unambiguous that this is not a resumption: once the transport is
+    /// replaced both ends discard everything they knew and begin again with a greeting. So
+    /// every channel, every handler and every caller waiting on a reply is dropped here — a
+    /// handle held across an upgrade will report the session closed, which is the truth.
+    async fn upgrade(
+        &mut self,
+        last_reply: Option<(u32, u32, Bytes)>,
+        swap: Swap,
+        config: Config,
+        reply: oneshot::Sender<Result<Greeting>>,
+        ready: &mut Option<oneshot::Sender<Result<Greeting>>>,
+    ) -> Result<()> {
+        if let Some((channel, msgno, payload)) = last_reply {
+            self.session
+                .send(channel, FrameKind::Rpy, msgno, None, with_mime(&payload))?;
+        }
+
+        // Everything queued has to be on the wire before the handshake starts: the peer is
+        // waiting for that reply before it sends its first octet of TLS.
+        while let Some(bytes) = self.session.poll_transmit() {
+            self.out.extend_from_slice(&bytes);
+        }
+        self.io.writer.write_all(&self.out).await?;
+        self.io.writer.flush().await?;
+        self.out.clear();
+
+        let io = std::mem::replace(&mut self.io, Io::placeholder()).reunite();
+        match swap(io).await {
+            Ok(upgraded) => self.io = Io::new(upgraded),
+            Err(error) => {
+                // The old transport is gone with the failed handshake, so there is nothing
+                // left to run a session over.
+                self.awaiting_upgrade = false;
+                let _ = reply.send(Err(error));
+                return Err(Error::Closed);
+            }
+        }
+
+        self.session = Session::new(config);
+        self.routes.reset();
+        self.served.clear();
+        self.awaiting_upgrade = false;
+        // Whoever asked for the upgrade gets the new greeting, through the same path a fresh
+        // session reports its first one.
+        *ready = Some(reply);
+        Ok(())
     }
 
     /// Carries out one request from a handle.
@@ -444,6 +682,10 @@ where
                     .map_err(Error::from);
                 let _ = reply.send(result);
             }
+            // `dispatch` takes this one, because it has to await; it never arrives here.
+            Command::Upgrade { reply, .. } => {
+                let _ = reply.send(Err(Error::Closed));
+            }
             Command::CloseSession { reply } => {
                 match self
                     .session
@@ -472,6 +714,7 @@ where
         match handler.accept(&uri, start) {
             Ok(profile) => {
                 if self.session.accept_start(channel, msgno, profile).is_ok() {
+                    self.awaiting_upgrade |= handler.upgrades_transport();
                     self.served.insert(channel, Arc::clone(&handler));
                     if let Some(commands) = self.routes.commands.upgrade() {
                         let responder = Responder::new(self.id, channel, commands);

@@ -30,10 +30,12 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 use vortice_proto::frame::FrameKind;
+use vortice_proto::greeting::Greeting;
 use vortice_proto::management::{ErrorReply, Profile, Start, code};
+use vortice_proto::session::Config;
 
 use crate::channel::{Message, Reply};
-use crate::connection::{Command, SessionId};
+use crate::connection::{BoxedTransport, Command, SessionId};
 use crate::error::{Error, Result};
 
 /// What a handler returns: a task the session will drive to completion.
@@ -69,6 +71,24 @@ pub trait Handler: Send + Sync + 'static {
     /// Whatever the profile wants the peer to be told.
     fn accept(&self, uri: &str, _start: &Start) -> std::result::Result<Profile, ErrorReply> {
         Ok(Profile::new(uri))
+    }
+
+    /// Whether accepting a channel of this profile is about to replace the transport.
+    ///
+    /// A profile that answers `true` promises to call [`Responder::upgrade`] from
+    /// [`Handler::on_open`]. In exchange the session stops reading the moment the start is
+    /// accepted, and does not start again until the transport has been replaced.
+    ///
+    /// That pause is not an optimisation, it is the whole point. BEEP's TLS profile agrees to
+    /// the upgrade in the channel exchange itself, and the peer begins its handshake as soon
+    /// as it sees the accepting reply — so without the pause the session would race to read
+    /// those octets and hand them to a BEEP parser, ending the connection. The window is
+    /// small, which is worse than large: it would fail rarely and under load.
+    ///
+    /// A handler that answers `true` and then never upgrades leaves the session unable to
+    /// read, so only a profile that really does replace the transport should.
+    fn upgrades_transport(&self) -> bool {
+        false
     }
 }
 
@@ -236,6 +256,63 @@ impl Responder {
     #[must_use]
     pub const fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// Replies to `msgno` and then replaces the transport, as one step.
+    ///
+    /// The listening half of [`Connection::upgrade`](crate::Connection::upgrade), and the
+    /// reason it exists rather than a plain `reply` followed by an upgrade: the peer starts
+    /// its TLS handshake the instant it sees the reply, so if the driver got a chance to read
+    /// between the two it would feed the first octets of that handshake to a BEEP parser and
+    /// end the session. Sending the reply and swapping the transport in one command removes
+    /// the window entirely.
+    ///
+    /// Returns the greeting of the session that follows.
+    ///
+    /// # Errors
+    ///
+    /// As [`Connection::upgrade`](crate::Connection::upgrade).
+    pub async fn reply_then_upgrade<F, Fut>(
+        &self,
+        msgno: u32,
+        payload: impl Into<Bytes>,
+        config: Config,
+        swap: F,
+    ) -> Result<Greeting>
+    where
+        F: FnOnce(BoxedTransport) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<BoxedTransport>> + Send + 'static,
+    {
+        crate::connection::upgrade_session(
+            &self.commands,
+            Some((self.channel, msgno, payload.into())),
+            config,
+            swap,
+        )
+        .await
+    }
+
+    /// Replaces the transport once whatever is already queued has gone out.
+    ///
+    /// This is the shape BEEP's TLS profile actually needs. Its agreement is piggybacked on
+    /// the channel exchange itself — `<ready />` inside the `<start>`, `<proceed />` inside the
+    /// `<profile>` that answers it — so by the time a handler runs there is no reply left to
+    /// send, only a transport to replace.
+    ///
+    /// Safe to call from [`Handler::on_open`] **only** when the handler also returns `true`
+    /// from [`Handler::upgrades_transport`]. That is what stops the session reading between
+    /// the accepting reply and this call; without it the peer's first handshake octets would
+    /// reach a BEEP parser instead.
+    ///
+    /// # Errors
+    ///
+    /// As [`Connection::upgrade`](crate::Connection::upgrade).
+    pub async fn upgrade<F, Fut>(&self, config: Config, swap: F) -> Result<Greeting>
+    where
+        F: FnOnce(BoxedTransport) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<BoxedTransport>> + Send + 'static,
+    {
+        crate::connection::upgrade_session(&self.commands, None, config, swap).await
     }
 
     /// Changes the window advertised for incoming traffic on this channel.
