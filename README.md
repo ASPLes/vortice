@@ -19,6 +19,7 @@ Production Line (ASPL) maintainers of [LibVortex 1.1](https://github.com/ASPLes/
 | `vortice` | Async sessions over tokio: client, server, profile router |
 | `vortice-http` | BEEP reached through an HTTP/1.1 upgrade, so it shares a port with an HTTP server |
 | `vortice-ws` | BEEP over WebSocket (RFC6455), which reaches through infrastructure that only passes web traffic. Also shares a port with plain BEEP |
+| `vortice-tls` | The BEEP TLS profile (RFC3080 §3.1) over rustls: a session begins in the clear and is tuned in band |
 | `vortice-interop` | Test harness driving the LibVortex regression suite. Not published |
 
 `vortice-ws` has no optional features and no WebSocket dependency: the binding needs to

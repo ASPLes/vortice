@@ -4,6 +4,7 @@ members = [
     "vortice",
     "vortice-http",
     "vortice-proto",
+    "vortice-tls",
     "vortice-ws",
     "vortice-interop",
 ]
