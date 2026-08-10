@@ -1,0 +1,28 @@
+[package]
+name = "vortice-tls"
+description = "The BEEP TLS profile (RFC3080 §3.1) for Vortice, over rustls"
+keywords = ["beep", "rfc3080", "tls", "rustls"]
+categories = ["network-programming", "cryptography"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+rustls-pemfile = "2.2"
+tokio = { version = "1", features = ["io-util", "net", "rt"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+tracing = "0.1"
+vortice = { path = "../vortice", version = "0.0.0" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rcgen = "0.14"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+vortice-interop = { path = "../vortice-interop" }
