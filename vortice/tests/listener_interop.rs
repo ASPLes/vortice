@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, MutexGuard};
 use vortice::{Config, Role, Server};
-use vortice_interop::LibVortex;
+use vortice_interop::{LibVortex, SuiteLock};
 
 use vortice_interop::profiles::regression_router;
 
@@ -31,6 +31,11 @@ async fn exclusive() -> MutexGuard<'static, ()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_c_client_passes_its_tests_against_a_vortice_listener() {
     let _guard = exclusive().await;
+    // Only one interop test may drive the suite at a time, whichever crate it lives in:
+    // three C clients moving tens of megabytes at once make the suite's own timing-sensitive
+    // tests fail. Held for the whole test.
+    let _suite = SuiteLock::acquire();
+
     let suite = match LibVortex::from_env() {
         Some(suite) if suite.is_built() => suite,
         Some(suite) => {

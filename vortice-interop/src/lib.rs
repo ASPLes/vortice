@@ -60,7 +60,10 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+mod lock;
 pub mod profiles;
+
+pub use lock::SuiteLock;
 
 /// Environment variable naming the LibVortex `test/` directory.
 pub const TEST_DIR_VAR: &str = "VORTICE_LIBVORTEX_TEST_DIR";
@@ -277,6 +280,13 @@ impl LibVortex {
         // The suite matches its options in a fixed order, with --offset-port first, so it
         // has to be passed before --run-test rather than after.
         command.arg(format!("--offset-port={}", self.port_offset));
+        // Several tests assert on how long a transfer took, and those assertions say more
+        // about how busy the machine is than about the listener: `test_02m` moves about 40 MB
+        // and `test_04a` about 33 MB, and both have failed here purely from other tests
+        // running alongside. Every protocol assertion still holds; only the stopwatch is
+        // dropped. The suite offers this for exactly this reason — its own documentation
+        // recommends it whenever the run is not alone on the machine.
+        command.arg("--disable-time-checks");
         if !tests.is_empty() {
             command.arg(format!("--run-test={}", tests.join(",")));
         }
