@@ -17,6 +17,11 @@
 //! unless asked to, which is also why its own TLS tests keep passing against material that
 //! expired five years ago.
 //!
+//! This test was intermittent for a while, and what it was catching was real: LibVortex's TLS
+//! transport never reported what OpenSSL still held decrypted, so a TLS record carrying more
+//! than one BEEP frame lost everything past the first. Both ends then waited with empty socket
+//! queues. Fixed in `tls/vortex_tls.c`; see §8 of the design decisions.
+//!
 //! Requires `VORTICE_LIBVORTEX_TEST_DIR`; without it the test reports itself as skipped.
 
 use std::time::Duration;
@@ -26,14 +31,6 @@ use vortice_interop::LibVortex;
 use vortice_interop::profiles::regression_router;
 use vortice_tls::{PROFILE_URI, TlsProfile};
 
-// Ignored, and it should stay ignored until the stall below is understood rather than until
-// it stops reproducing. The negotiation, the swap and the second greeting exchange are all
-// reached every time — the three were confirmed by logging them — and the session then stalls
-// partway through the transfer that follows, with neither peer having anything queued in its
-// socket: both are waiting for the other. One real cause has been found and fixed (the driver
-// never flushed, so a `SEQ` could sit inside rustls' buffer and never reach the peer), which
-// took the failure rate from 9 in 10 to 6 in 10. Something else remains.
-#[ignore = "stalls intermittently after the swap; see the note above and F6 in the plan"]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_c_client_tunes_a_vortice_listener_for_tls() {
     let suite = match LibVortex::from_env() {
