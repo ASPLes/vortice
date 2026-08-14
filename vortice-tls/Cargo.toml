@@ -26,3 +26,5 @@ rcgen = "0.14"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 vortice-interop = { path = "../vortice-interop" }
+vortice-ws = { path = "../vortice-ws" }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

@@ -44,6 +44,13 @@
 //! # }
 //! ```
 //!
+//! # Implicit TLS, and sharing a port
+//!
+//! [`connect`] and [`serve`] run BEEP inside TLS from the first octet, which is what a
+//! TLS-terminating proxy produces and what deployments reach for when there is a port to
+//! spare. [`looks_like_tls`] tells a handshake from plain BEEP and from an HTTP request, so
+//! one port can take all three.
+//!
 //! # Server
 //!
 //! [`TlsProfile`] is a [`Handler`] like any other, so a listener offers TLS by registering it:
@@ -65,6 +72,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod implicit;
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -78,6 +86,10 @@ use vortice::{
 };
 
 pub use error::{Error, Result};
+pub use implicit::{
+    BEEP_ALPN, accept, acceptor, connect, connect_over, looks_like_tls, serve, with_client_alpn,
+    with_server_alpn,
+};
 
 /// The profile URI that names this negotiation.
 pub const PROFILE_URI: &str = "http://iana.org/beep/TLS";

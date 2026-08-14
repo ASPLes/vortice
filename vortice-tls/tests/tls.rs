@@ -240,3 +240,168 @@ async fn a_start_without_the_piggyback_is_refused() {
         other => panic!("expected a refusal, got {other}"),
     }
 }
+
+/// BEEP inside TLS from the first octet, with no in-band negotiation at all.
+#[tokio::test]
+async fn a_session_runs_inside_implicit_tls() {
+    let (certificates, key) = certificate();
+    let acceptor = vortice_tls::acceptor(
+        vortice_tls::server_config(&certificates, &key).expect("server configuration"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("local address").to_string();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            let router = Router::new().profile(ECHO, echo_handler());
+            tokio::spawn(async move {
+                let _ = vortice_tls::serve(
+                    stream,
+                    &acceptor,
+                    Config::new(Role::Listener).with_profile(ECHO),
+                    router,
+                )
+                .await;
+            });
+        }
+    });
+
+    let session = within(vortice_tls::connect(
+        address.as_str(),
+        "localhost",
+        vortice_tls::client_config(&certificates).expect("client configuration"),
+        Config::new(Role::Initiator).with_profile(ECHO),
+    ))
+    .await
+    .expect("connect inside TLS");
+
+    let channel = within(session.open_channel(Profile::new(ECHO)))
+        .await
+        .expect("open a channel");
+    let reply = within(channel.request("inside tls")).await.expect("reply");
+    assert_eq!(reply.payload(), b"inside tls");
+
+    within(session.close()).await.expect("close");
+}
+
+/// ALPN is what lets one TLS port carry more than one protocol, so the name has to survive
+/// the handshake and be what the server chose.
+#[tokio::test]
+async fn alpn_is_negotiated_on_an_implicit_session() {
+    let (certificates, key) = certificate();
+    let server = vortice_tls::with_server_alpn(
+        vortice_tls::server_config(&certificates, &key).expect("server configuration"),
+        &[vortice_tls::BEEP_ALPN, "http/1.1"],
+    );
+    let acceptor = vortice_tls::acceptor(server);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("local address").to_string();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            let router = Router::new().profile(ECHO, echo_handler());
+            tokio::spawn(async move {
+                let _ = vortice_tls::serve(
+                    stream,
+                    &acceptor,
+                    Config::new(Role::Listener).with_profile(ECHO),
+                    router,
+                )
+                .await;
+            });
+        }
+    });
+
+    // The client offers only BEEP, so agreement is the only possible outcome.
+    let client = vortice_tls::with_client_alpn(
+        vortice_tls::client_config(&certificates).expect("client configuration"),
+        &[vortice_tls::BEEP_ALPN],
+    );
+
+    let session = within(vortice_tls::connect(
+        address.as_str(),
+        "localhost",
+        client,
+        Config::new(Role::Initiator).with_profile(ECHO),
+    ))
+    .await
+    .expect("connect with ALPN");
+
+    let channel = within(session.open_channel(Profile::new(ECHO)))
+        .await
+        .expect("open a channel");
+    assert_eq!(
+        within(channel.request("alpn"))
+            .await
+            .expect("reply")
+            .payload(),
+        b"alpn"
+    );
+}
+
+/// A client that speaks nothing the server does must be refused during the handshake, or ALPN
+/// would be advisory rather than a demultiplexer.
+#[tokio::test]
+async fn alpn_without_a_common_protocol_is_refused() {
+    let (certificates, key) = certificate();
+    let server = vortice_tls::with_server_alpn(
+        vortice_tls::server_config(&certificates, &key).expect("server configuration"),
+        &[vortice_tls::BEEP_ALPN],
+    );
+    let acceptor = vortice_tls::acceptor(server);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("local address").to_string();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let _ = vortice_tls::serve(
+                    stream,
+                    &acceptor,
+                    Config::new(Role::Listener),
+                    Router::new(),
+                )
+                .await;
+            });
+        }
+    });
+
+    let client = vortice_tls::with_client_alpn(
+        vortice_tls::client_config(&certificates).expect("client configuration"),
+        &["something-else"],
+    );
+
+    let error = within(vortice_tls::connect(
+        address.as_str(),
+        "localhost",
+        client,
+        Config::new(Role::Initiator),
+    ))
+    .await
+    .expect_err("no protocol in common");
+    assert!(
+        matches!(error, vortice_tls::Error::Handshake(_)),
+        "expected the handshake to refuse it, got {error}"
+    );
+}
