@@ -62,6 +62,10 @@ pub async fn serve_wss(port: u16, acceptor: TlsAcceptor) -> std::io::Result<()> 
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            // Without this the session crawls: BEEP paces itself frame by frame against the
+            // peer's window, so almost every write is small and Nagle holds each one waiting
+            // for an acknowledgement that only arrives on the delayed-ACK timer.
+            let _ = stream.set_nodelay(true);
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(stream).await else {
@@ -94,6 +98,7 @@ pub async fn serve_shared(port: u16, acceptor: TlsAcceptor) -> std::io::Result<(
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            let _ = stream.set_nodelay(true);
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 let _ = serve_one_shared(stream, acceptor).await;
