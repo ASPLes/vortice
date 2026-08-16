@@ -217,12 +217,29 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<T> {
 
         // One BEEP frame per WebSocket frame — see the framing note in the crate
         // documentation for why this is the binding rather than an optimisation.
-        let take = frame_boundary(buf)
-            .unwrap_or(buf.len())
-            .min(MAX_SEND_PAYLOAD);
-        this.queue(OpCode::Binary, &buf[..take])?;
+        // One BEEP frame per WebSocket frame, but as many of them per write as are ready.
+        //
+        // The rule LibVortex needs is about the wire — a WebSocket frame it reads must hold
+        // exactly one BEEP frame — and says nothing about how many go out per call. Emitting
+        // only one and returning was the obvious reading of that, and it is catastrophic over
+        // a transport that packages each write: every BEEP frame became its own TLS record,
+        // and a bulk transfer that takes under two seconds took over two minutes.
+        let mut taken = 0;
+        while taken < buf.len() && taken < MAX_SEND_PAYLOAD {
+            let rest = &buf[taken..];
+            let take = match frame_boundary(rest) {
+                Some(end) => end,
+                // Not a whole BEEP frame: hand on what is there and let the next call finish
+                // it. Splitting one frame across WebSocket frames is the case LibVortex does
+                // handle, so this is safe as well as necessary.
+                None => rest.len().min(MAX_SEND_PAYLOAD),
+            };
+            this.queue(OpCode::Binary, &rest[..take])?;
+            taken += take;
+        }
+
         let _ = this.poll_drain(cx)?;
-        Poll::Ready(Ok(take))
+        Poll::Ready(Ok(taken))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
