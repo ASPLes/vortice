@@ -83,6 +83,14 @@
 //! either way. [`vortice_proto::codec::frame_boundary`] finds the boundary; no BEEP parsing
 //! is duplicated here.
 //!
+//! The rule cuts both ways, and the writer keeps both halves. A WebSocket frame never carries
+//! more than one BEEP frame, and never less than one either: a BEEP frame larger than the
+//! batching budget goes out whole rather than split, and a write ending mid-frame is held back
+//! until the write that finishes it. What the budget bounds is how many frames one call
+//! encodes before the socket is given a chance to drain — emitting a single frame per call is
+//! what once turned every BEEP frame into its own TLS record and a two second transfer into a
+//! two minute one.
+//!
 //! # Sharing a port with plain BEEP
 //!
 //! [`serve_shared`] takes either on one port, deciding per connection from the first four

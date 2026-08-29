@@ -15,11 +15,14 @@ use bytes::{BufMut, BytesMut};
 /// window and never approach this.
 pub(crate) const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
-/// Largest payload put into one outgoing frame.
+/// How much payload one write puts into frames before it returns and lets the caller come
+/// back for the rest.
 ///
-/// Writes larger than this are split across frames. Message boundaries carry no meaning in
-/// this binding, so splitting is free.
-pub(crate) const MAX_SEND_PAYLOAD: usize = 64 * 1024;
+/// This is a batching budget, not a frame size: a BEEP frame larger than this still goes out
+/// whole, in one WebSocket frame, because splitting it would break the binding's framing rule.
+/// What the budget bounds is how much of one write is encoded before the socket is given a
+/// chance to drain.
+pub(crate) const MAX_SEND_BATCH: usize = 64 * 1024;
 
 /// A frame type, from the four-bit opcode of RFC6455 §5.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

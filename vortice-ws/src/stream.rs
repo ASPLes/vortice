@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use vortice_proto::codec::frame_boundary;
 
 use crate::codec::{Decoder, Event};
-use crate::frame::{self, MAX_SEND_PAYLOAD, OpCode};
+use crate::frame::{self, MAX_SEND_BATCH, OpCode};
 
 /// How much encoded output may pile up before a write waits for the socket to drain.
 ///
@@ -53,6 +53,13 @@ pub struct WsStream<T> {
     payload: BytesMut,
     /// Encoded frames waiting to go out.
     outbound: BytesMut,
+    /// The tail of a write that was not a whole BEEP frame, held until the rest arrives.
+    ///
+    /// A WebSocket frame must carry exactly one BEEP frame, so an incomplete one cannot be
+    /// put on the wire: it waits here for the write that finishes it. The session driver
+    /// hands over whole frames and never fills this, but `AsyncWrite` promises nothing of the
+    /// sort, and a flush empties it rather than let anything be held indefinitely.
+    partial: BytesMut,
     decoder: Decoder,
     /// Set once the peer's close frame or end of file has been seen.
     finished: bool,
@@ -69,6 +76,7 @@ impl<T> WsStream<T> {
             inbound: BytesMut::from(&prefix[..]),
             payload: BytesMut::new(),
             outbound: BytesMut::new(),
+            partial: BytesMut::new(),
             decoder: Decoder::new(),
             finished: false,
             closing: false,
@@ -104,6 +112,34 @@ impl<T> WsStream<T> {
         self.outbound.extend_from_slice(payload);
         if let Some(mask) = mask {
             frame::apply_mask(&mut self.outbound[at..], mask, 0);
+        }
+        Ok(())
+    }
+
+    /// Queues every whole BEEP frame held back so far, one WebSocket frame each.
+    ///
+    /// Returns how much payload that was, which is what the batching budget counts.
+    fn queue_whole_frames(&mut self) -> io::Result<usize> {
+        let mut queued = 0;
+        while let Some(end) = frame_boundary(&self.partial) {
+            let frame = self.partial.split_to(end);
+            self.queue(OpCode::Binary, &frame)?;
+            queued += end;
+        }
+        Ok(queued)
+    }
+
+    /// Puts whatever is still held back on the wire, whole frame or not.
+    ///
+    /// A flush is the caller saying there is nothing more coming, so holding octets back any
+    /// longer would lose them. The BEEP driver flushes only between frames, so in this
+    /// crate's own use there is never anything here; a caller that flushes mid-frame gets a
+    /// split frame, which is better than silence.
+    fn flush_partial(&mut self) -> io::Result<()> {
+        self.queue_whole_frames()?;
+        if !self.partial.is_empty() {
+            let rest = std::mem::take(&mut self.partial);
+            self.queue(OpCode::Binary, &rest)?;
         }
         Ok(())
     }
@@ -215,8 +251,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<T> {
             ready!(this.poll_drain(cx))?;
         }
 
-        // One BEEP frame per WebSocket frame — see the framing note in the crate
-        // documentation for why this is the binding rather than an optimisation.
         // One BEEP frame per WebSocket frame, but as many of them per write as are ready.
         //
         // The rule LibVortex needs is about the wire — a WebSocket frame it reads must hold
@@ -224,18 +258,34 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<T> {
         // only one and returning was the obvious reading of that, and it is catastrophic over
         // a transport that packages each write: every BEEP frame became its own TLS record,
         // and a bulk transfer that takes under two seconds took over two minutes.
+        //
+        // The rule is kept in both directions here. A BEEP frame larger than the batching
+        // budget goes out whole rather than being cut in two, and a write that ends in the
+        // middle of one holds the remainder back instead of sending half a frame.
         let mut taken = 0;
-        while taken < buf.len() && taken < MAX_SEND_PAYLOAD {
+        let mut queued = 0;
+
+        // What is already held back is the head of the stream, so it has to be completed
+        // before anything in this write can be looked at on its own.
+        if !this.partial.is_empty() {
+            this.partial.extend_from_slice(buf);
+            taken = buf.len();
+            queued += this.queue_whole_frames()?;
+        }
+
+        while taken < buf.len() && queued < MAX_SEND_BATCH {
             let rest = &buf[taken..];
-            let take = match frame_boundary(rest) {
-                Some(end) => end,
-                // Not a whole BEEP frame: hand on what is there and let the next call finish
-                // it. Splitting one frame across WebSocket frames is the case LibVortex does
-                // handle, so this is safe as well as necessary.
-                None => rest.len().min(MAX_SEND_PAYLOAD),
-            };
-            this.queue(OpCode::Binary, &rest[..take])?;
-            taken += take;
+            match frame_boundary(rest) {
+                Some(end) => {
+                    this.queue(OpCode::Binary, &rest[..end])?;
+                    taken += end;
+                    queued += end;
+                }
+                None => {
+                    this.partial.extend_from_slice(rest);
+                    taken = buf.len();
+                }
+            }
         }
 
         let _ = this.poll_drain(cx)?;
@@ -244,12 +294,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<T> {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        this.flush_partial()?;
         ready!(this.poll_drain(cx))?;
         Pin::new(&mut this.io).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        this.flush_partial()?;
         if !this.closing {
             this.closing = true;
             this.queue(OpCode::Close, &1000u16.to_be_bytes())?;
@@ -263,8 +315,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<T> {
 mod tests {
     use super::WsStream;
     use crate::codec::{Decoder, Event};
-    use crate::frame::{self, MAX_SEND_PAYLOAD, OpCode};
+    use crate::frame::{self, MAX_SEND_BATCH, OpCode};
     use bytes::{Bytes, BytesMut};
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Builds one frame the way a peer would.
@@ -464,28 +517,90 @@ mod tests {
         );
     }
 
+    /// Builds one BEEP frame with a payload of `size` octets.
+    fn beep_frame(msgno: u32, seqno: u32, size: usize) -> Vec<u8> {
+        let mut frame = format!("MSG 0 {msgno} . {seqno} {size}\r\n").into_bytes();
+        frame.extend((0..size).map(|index| (index % 251) as u8));
+        frame.extend_from_slice(b"END\r\n");
+        frame
+    }
+
+    /// The other half of the framing rule: a BEEP frame larger than the batching budget must
+    /// not be cut in two. LibVortex reads one BEEP frame out of each WebSocket frame, so half
+    /// a frame is a frame it cannot parse.
     #[tokio::test]
-    async fn a_large_write_is_split_across_frames_that_rejoin() {
+    async fn a_beep_frame_larger_than_the_batch_stays_in_one_websocket_frame() {
         let (ours, mut theirs) = tokio::io::duplex(4 * 1024 * 1024);
         let mut stream = WsStream::server(ours, Bytes::new());
 
-        let payload: Vec<u8> = (0..MAX_SEND_PAYLOAD * 3 + 17)
-            .map(|index| (index % 251) as u8)
-            .collect();
-        stream.write_all(&payload).await.expect("write");
+        let frame = beep_frame(0, 0, MAX_SEND_BATCH * 3 + 17);
+        stream.write_all(&frame).await.expect("write");
         stream.flush().await.expect("flush");
         drop(stream);
 
         let mut wire = Vec::new();
         theirs.read_to_end(&mut wire).await.expect("peer read");
+        assert_eq!(decode(&wire), vec![Event::Data(Bytes::from(frame))]);
+    }
 
-        let mut rejoined = Vec::new();
-        for event in decode(&wire) {
-            if let Event::Data(data) = event {
-                rejoined.extend_from_slice(&data);
-            }
-        }
-        assert_eq!(rejoined, payload);
+    /// Several frames in one write are batched, but the batch stops at the budget so the
+    /// socket gets a chance to drain — and every frame still travels whole and on its own.
+    #[tokio::test]
+    async fn a_batch_of_frames_stops_at_the_budget_without_splitting_one() {
+        let (ours, mut theirs) = tokio::io::duplex(4 * 1024 * 1024);
+        let mut stream = WsStream::server(ours, Bytes::new());
+
+        let each = MAX_SEND_BATCH / 2;
+        let frames: Vec<Vec<u8>> = (0..5).map(|n| beep_frame(n, n * 4, each)).collect();
+        let batch: Vec<u8> = frames.concat();
+
+        let written = stream.write(&batch).await.expect("write");
+        assert!(
+            written < batch.len(),
+            "the budget should stop the batch short of the whole write"
+        );
+        stream.write_all(&batch[written..]).await.expect("write");
+        stream.flush().await.expect("flush");
+        drop(stream);
+
+        let mut wire = Vec::new();
+        theirs.read_to_end(&mut wire).await.expect("peer read");
+        assert_eq!(
+            decode(&wire),
+            frames
+                .into_iter()
+                .map(|frame| Event::Data(Bytes::from(frame)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A write ending mid-frame is held back rather than sent as half a BEEP frame.
+    #[tokio::test]
+    async fn a_write_ending_mid_frame_waits_for_the_rest() {
+        let (ours, mut theirs) = tokio::io::duplex(1024 * 1024);
+        let mut stream = WsStream::server(ours, Bytes::new());
+
+        let frame = beep_frame(0, 0, 4096);
+        let (head, tail) = frame.split_at(1000);
+        stream.write_all(head).await.expect("write");
+
+        // Nothing may be on the wire yet: what was handed over is not a whole BEEP frame.
+        let mut wire = BytesMut::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), theirs.read_buf(&mut wire))
+                .await
+                .is_err(),
+            "half a frame reached the peer: {wire:?}"
+        );
+
+        stream.write_all(tail).await.expect("write");
+        stream.flush().await.expect("flush");
+        drop(stream);
+
+        let mut rest = Vec::new();
+        theirs.read_to_end(&mut rest).await.expect("peer read");
+        wire.extend_from_slice(&rest);
+        assert_eq!(decode(&wire), vec![Event::Data(Bytes::from(frame))]);
     }
 
     #[tokio::test]
