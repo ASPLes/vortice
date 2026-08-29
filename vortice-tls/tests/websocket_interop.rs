@@ -58,18 +58,55 @@ async fn the_c_client_passes_its_websocket_tls_tests_against_vortice() {
         .await
         .expect("bind the listeners");
 
-    // `test_17` runs the whole battery over plain WebSocket and `test_18` opens a `wss`
-    // session; both pass every time.
+    // All four run here: `test_17` is the whole battery over plain WebSocket, `test_18` opens
+    // a `wss` session, `test_19` is the battery again over `wss`, and `test_20` walks the
+    // shared port through its three phases.
     //
-    // `test_19` and `test_20` are absent, and for what looks like one reason: anything that
-    // pushes real payload over `wss` loses frames. `test_19` fails at `test_01a`, and
-    // `test_20`'s third phase — the same shared port, now over `wss` — fails intermittently
-    // with a reply that never arrives. Both appeared once writes stopped being one BEEP frame
-    // at a time, which is the same signature as the two buffering defects already found: a
-    // peer that is handed several BEEP frames at once reads the first and loses the rest.
-    // Here the suspect is OpenSSL underneath noPoll, whose `nopoll_conn_read_pending` reports
-    // only noPoll's own buffer. Not confirmed — see F5 in the plan.
-    let tests = ["test_17", "test_18"];
+    // `test_19` and `test_20` were out of this list for a long time, because anything that
+    // pushed real payload over `wss` lost frames here. What kept them out in the end was this
+    // harness: `LibVortex::run_client` ran the libtool wrapper script, which puts the
+    // *installed* library directory ahead of everything, so every measurement was made
+    // against a noPoll from 2022 — three upstream fixes behind the checkout the run was
+    // supposed to be proving things about, including the one for exactly this symptom. Run by
+    // hand with `LD_LIBRARY_PATH` pointing at the in-tree `.libs`, all four tests had been
+    // passing for some time. The harness now runs the real ELF with that path set; if this
+    // test ever starts failing at `test_01a` again, check `ldd` on the client before
+    // anything else.
+    //
+    // The two defects the hunt did find are real and are fixed upstream, and the search for a
+    // third — in OpenSSL underneath noPoll — ended in the finding that there was none to look
+    // for. Do not reopen it. Measured against OpenSSL 1.1.1, of the three ways a TLS
+    // transport can hold octets where `select()` cannot see them:
+    //
+    //   - Several WebSocket frames inside ONE TLS record. Real, and a genuine defect, but in
+    //     noPoll's own event loop (`nopoll_loop_process_data` read a single message per
+    //     readable event). Fixed upstream, covered by noPoll's `test_48`. It never affected
+    //     this path: LibVortex does not call `nopoll_loop_wait` anywhere. It drives sockets
+    //     from `vortex_reader.c` and already drains what noPoll holds, by publishing
+    //     `nopoll_conn_read_pending` as the `try_read_pending` connection key and looping on
+    //     it in `__vortex_reader_process_socket_pending`.
+    //
+    //   - Several TLS records inside one TCP segment.
+    //   - A record ending mid-WebSocket-header, leaving a partial header in noPoll's
+    //     `pending_buf` (which `nopoll_conn_read_pending` deliberately does not report).
+    //
+    // Neither of the last two stalls, and for the same reason: OpenSSL keeps `read_ahead` off
+    // for TLS, so the record layer takes exactly one record off the socket and everything
+    // behind it stays in the kernel, where `select()` still sees it. Measured with two real
+    // TLS peers, corked into a single segment, after consuming the first record:
+    // `SSL_pending()` 0, `SSL_has_pending()` 0, `select()` 1. The same probe with
+    // `SSL_CTX_set_read_ahead()` on gives 0, 1, 0 — the stall — but neither noPoll nor
+    // LibVortex ever enables it, and noPoll wires the session with `SSL_set_fd()`, with no
+    // buffering BIO of its own. (DTLS would enable read_ahead by itself; this is TLS.)
+    //
+    // Measured on 2026-08-23 against both C trees at HEAD: 20 consecutive runs of all four
+    // tests, one failure — and that failure was `test_17`'s `test_04a` losing one ANS frame
+    // of 4096, over plain WebSocket. The same loss reproduces over plain BEEP with no
+    // WebSocket and no TLS in the path (once in 40 runs of `test_04a` against
+    // `vortice --example regression-listener`), so it is a separate defect in the ANS/NUL
+    // path that these tests inherit rather than anything this file covers. It is `wss`'s
+    // problem no more than it is plain TCP's: see `doc/plan-next-steps.md`.
+    let tests = ["test_17", "test_18", "test_19", "test_20"];
     let run = tokio::time::timeout(
         Duration::from_secs(300),
         tokio::task::spawn_blocking(move || suite.run_client(&tests)),
