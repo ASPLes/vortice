@@ -31,7 +31,8 @@
 //! - an unrecognised `--run-test=` name matches nothing, runs no test at all, and still
 //!   prints `INFO: All test ok!`;
 //! - tests for modules the library was built without print `--- WARNING:` and return
-//!   success, so a green run does not prove those areas were covered.
+//!   success, so a green run does not prove those areas were covered — and eight of them,
+//!   every WebSocket and TLS one, announce it without that marker at all.
 //!
 //! There is a third trap, found while building this harness: the obvious defence against the
 //! first one — checking that the requested test name shows up in the output — does not work
@@ -116,6 +117,22 @@ const OK_MARKER: &str = "[   OK   ]";
 
 /// Marker a test prints when it self-skips because its module is not built in.
 const WARNING_MARKER: &str = "--- WARNING:";
+
+/// What a test prints when it self-skips *without* the marker above.
+///
+/// The `--- WARNING:` convention is not applied everywhere. Eight tests — `test_05f`,
+/// `test_14f`, `test_14g`, `test_14h`, `test_17`, `test_17a`, `test_18` and `test_19` —
+/// announce a missing module with a plain line and return success, so the run ends in
+/// `All test ok!` having exercised nothing:
+///
+/// ```text
+/// Test 17: no support for WebSocket (noPoll support), doing nothing..
+/// ```
+///
+/// That is every WebSocket and TLS test in the suite, which is to say precisely the ones a
+/// conformance job would be running. A LibVortex built without noPoll would report the whole
+/// of the WebSocket work as passing. Both forms are treated as a skip here.
+const SKIP_PHRASE: &str = "doing nothing..";
 
 /// Line the client prints when it finishes without a failure.
 const SUCCESS_LINE: &str = "All test ok!";
@@ -438,8 +455,9 @@ impl ClientRun {
 
     /// Validates the run, defending against the ways the suite reports a false pass.
     ///
-    /// Every name in `expected` must have completed, no `--- WARNING:` self-skip may be
-    /// present, and the final `All test ok!` line must be there.
+    /// Every name in `expected` must have completed, no self-skip may be present — in either
+    /// of the two forms the suite writes them, see [`SKIP_PHRASE`] — and the final
+    /// `All test ok!` line must be there.
     ///
     /// # Errors
     ///
@@ -462,7 +480,7 @@ impl ClientRun {
         if let Some(line) = self
             .stdout
             .lines()
-            .find(|line| line.contains(WARNING_MARKER))
+            .find(|line| line.contains(WARNING_MARKER) || line.contains(SKIP_PHRASE))
         {
             return Err(InteropError::TestSkipped {
                 line: line.trim().to_owned(),
@@ -761,6 +779,29 @@ mod tests {
         let output = "--- WARNING: TLS not enabled, skipping test\nINFO: All test ok!\n";
         assert!(matches!(
             run(output, true).check(&[]),
+            Err(InteropError::TestSkipped { .. })
+        ));
+    }
+
+    /// The dangerous half of the same trap: no marker, a completion line, and success.
+    #[test]
+    fn rejects_a_module_that_self_skips_without_the_marker() {
+        // Verbatim from a LibVortex built without noPoll. `test_17` returns true, so the
+        // run ends in `All test ok!` and the test even reports as completed — with the
+        // whole of the WebSocket conformance untested.
+        let output = format!(
+            "INFO: [begin] test_17\n\
+             Test 17: no support for WebSocket (noPoll support), doing nothing..\n\
+             {}INFO: [end] test_17\nINFO: All test ok!\n",
+            completion("test_17")
+        );
+        let result = run(&output, true);
+        assert!(
+            result.completed("test_17"),
+            "the suite does report it as run"
+        );
+        assert!(matches!(
+            result.check(&["test_17"]),
             Err(InteropError::TestSkipped { .. })
         ));
     }

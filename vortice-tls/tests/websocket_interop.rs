@@ -102,10 +102,12 @@ async fn the_c_client_passes_its_websocket_tls_tests_against_vortice() {
     // Measured on 2026-08-23 against both C trees at HEAD: 20 consecutive runs of all four
     // tests, one failure — and that failure was `test_17`'s `test_04a` losing one ANS frame
     // of 4096, over plain WebSocket. The same loss reproduces over plain BEEP with no
-    // WebSocket and no TLS in the path (once in 40 runs of `test_04a` against
-    // `vortice --example regression-listener`), so it is a separate defect in the ANS/NUL
+    // WebSocket and no TLS in the path, about three times in 740 runs of `test_04a` against
+    // `vortice --example regression-listener`, so it is a separate defect in the ANS/NUL
     // path that these tests inherit rather than anything this file covers. It is `wss`'s
-    // problem no more than it is plain TCP's: see `doc/plan-next-steps.md`.
+    // problem no more than it is plain TCP's: see `doc/plan-next-steps.md`. It is rare
+    // enough that this test will usually pass; a failure here reported as a short block
+    // count is that one, not a regression in this file.
     let tests = ["test_17", "test_18", "test_19", "test_20"];
     let run = tokio::time::timeout(
         Duration::from_secs(300),
