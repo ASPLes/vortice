@@ -94,6 +94,11 @@ pub const PORT_OFFSET_VAR: &str = "VORTICE_LIBVORTEX_PORT_OFFSET";
 /// nobody is tracking. Shifting by default keeps the two apart without anyone remembering to.
 pub const DEFAULT_PORT_OFFSET: u16 = 1000;
 
+/// Environment variable naming the directory holding noPoll's built shared library.
+///
+/// Only needed when the noPoll checkout is not `nopoll/` beside the LibVortex one.
+pub const NOPOLL_LIB_DIR_VAR: &str = "VORTICE_NOPOLL_LIB_DIR";
+
 /// How long [`Listener::wait_ready`] waits for the listener to accept connections.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -192,13 +197,69 @@ impl LibVortex {
     /// Path of `vortex-regression-listener`.
     #[must_use]
     pub fn listener_binary(&self) -> PathBuf {
-        self.test_dir.join("vortex-regression-listener")
+        self.binary("vortex-regression-listener")
     }
 
     /// Path of `vortex-regression-client`.
     #[must_use]
     pub fn client_binary(&self) -> PathBuf {
-        self.test_dir.join("vortex-regression-client")
+        self.binary("vortex-regression-client")
+    }
+
+    /// The real ELF under `.libs` when the tree was built with libtool, else the plain name.
+    ///
+    /// What sits at `test/vortex-regression-client` in a libtool build is a shell script that
+    /// prepends the *installed* library directory to `LD_LIBRARY_PATH` before executing the
+    /// binary. Running it therefore tests whatever LibVortex and noPoll are installed on the
+    /// machine rather than the checkout under test, silently and with no way to tell from the
+    /// output. That is not a hypothetical: it cost this project several rounds of measurement,
+    /// and then cost them again here — an interop run that had been reporting `test_19` as a
+    /// `wss` failure for weeks was loading a noPoll from 2022, three upstream fixes behind the
+    /// checkout it was supposed to be proving things about.
+    fn binary(&self, name: &str) -> PathBuf {
+        let real = self.test_dir.join(".libs").join(name);
+        if real.is_file() {
+            real
+        } else {
+            self.test_dir.join(name)
+        }
+    }
+
+    /// Every in-tree `.libs` directory, so the binaries load the checkout and not `/usr/lib`.
+    ///
+    /// The LibVortex tree keeps one per module beside the sources, and noPoll — which the
+    /// WebSocket transport needs — is a separate checkout, looked for at
+    /// [`NOPOLL_LIB_DIR_VAR`] and then beside the LibVortex one. Whatever `LD_LIBRARY_PATH`
+    /// already held is kept after them, so a system library still resolves what the checkout
+    /// does not provide.
+    #[must_use]
+    pub fn library_path(&self) -> std::ffi::OsString {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(root) = self.test_dir.parent() {
+            if let Ok(entries) = std::fs::read_dir(root) {
+                let mut modules: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|entry| entry.path().join(".libs"))
+                    .filter(|path| path.is_dir())
+                    .collect();
+                modules.sort();
+                dirs.extend(modules);
+            }
+            let nopoll = env::var_os(NOPOLL_LIB_DIR_VAR).map_or_else(
+                || {
+                    root.parent()
+                        .map(|above| above.join("nopoll").join("src").join(".libs"))
+                },
+                |dir| Some(PathBuf::from(dir)),
+            );
+            if let Some(nopoll) = nopoll.filter(|path| path.is_dir()) {
+                dirs.push(nopoll);
+            }
+        }
+        if let Some(inherited) = env::var_os("LD_LIBRARY_PATH") {
+            dirs.extend(env::split_paths(&inherited));
+        }
+        env::join_paths(dirs).unwrap_or_default()
     }
 
     /// Starts `vortex-regression-listener` and waits until it accepts connections.
@@ -233,6 +294,7 @@ impl LibVortex {
         let child = Command::new(&binary)
             .arg(format!("--offset-port={}", self.port_offset))
             .current_dir(&self.test_dir)
+            .env("LD_LIBRARY_PATH", self.library_path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -277,6 +339,8 @@ impl LibVortex {
         }
         let mut command = Command::new(&binary);
         command.current_dir(&self.test_dir);
+        // Without this the libraries under test are whatever is installed: see `binary`.
+        command.env("LD_LIBRARY_PATH", self.library_path());
         // The suite matches its options in a fixed order, with --offset-port first, so it
         // has to be passed before --run-test rather than after.
         command.arg(format!("--offset-port={}", self.port_offset));
