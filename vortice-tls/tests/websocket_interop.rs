@@ -108,7 +108,15 @@ async fn the_c_client_passes_its_websocket_tls_tests_against_vortice() {
     // problem no more than it is plain TCP's: see `doc/plan-next-steps.md`. It is rare
     // enough that this test will usually pass; a failure here reported as a short block
     // count is that one, not a regression in this file.
-    let tests = ["test_17", "test_18", "test_19", "test_20"];
+    // `test_17a`, `test_18a` and `test_18b` are the packing family, and they are here rather
+    // than only in the C suite because a listener is exactly what they exercise: two BEEP
+    // frames in one WebSocket frame, the same over TLS, and two WebSocket frames inside one
+    // TLS record. The last of those is the shape that cost weeks — see the note above — and
+    // it has teeth: against a LibVortex linked with a noPoll that predates the
+    // `SSL_pending()` fix it fails, reporting one reply where two were due.
+    let tests = [
+        "test_17", "test_17a", "test_18", "test_18a", "test_18b", "test_19", "test_20",
+    ];
     let run = tokio::time::timeout(
         Duration::from_secs(300),
         tokio::task::spawn_blocking(move || suite.run_client(&tests)),
