@@ -117,6 +117,15 @@ pub fn regression_router() -> Router {
                 message.payload.len()
             );
         }
+        // `test_05c` tunes the session with a serverName and then asks the listener what it
+        // sees, which is the only way from the wire to check the name survived the swap.
+        if message.payload.as_ref() == b"GET serverName" {
+            let name = responder.server_name().await.ok().flatten();
+            let _ = responder
+                .reply(message.msgno, name.unwrap_or_default())
+                .await;
+            return;
+        }
         let _ = responder.reply(message.msgno, message.payload).await;
     };
     // /mixing-replies alternates between reply shapes per connection, so it needs somewhere

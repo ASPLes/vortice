@@ -10,12 +10,13 @@
 //! connection, so what is certified here is the whole path: the negotiation, the swap, the
 //! second greeting exchange, and BEEP framing across the TLS record layer.
 //!
-//! The certificate is generated here rather than taken from the suite. The suite's own
-//! (`test-certificate.pem`) is a 1024-bit RSA key signed with SHA-1 that expired in July 2021,
-//! and rustls will not load any of those three things — reasonably, since all three are below
-//! what it considers usable. Nothing is lost for this test: LibVortex verifies no certificate
-//! unless asked to, which is also why its own TLS tests keep passing against material that
-//! expired five years ago.
+//! The certificate is the suite's own, `test-certificate.pem`, and that matters for one of
+//! these tests: `test_05a2` reads the peer certificate off the tuned connection and compares
+//! its MD5 digest against a value written into the C source. Serving anything else — a
+//! certificate generated here, which is what this test did while the suite's was a 1024-bit
+//! SHA-1 one that expired in 2021 — makes that comparison fail for a reason that has nothing
+//! to do with the code under test. The suite's material has since been regenerated (RSA 2048,
+//! SHA-256, valid to 2036), so rustls loads it and the pinned digest matches.
 //!
 //! This test was intermittent for a while, and what it was catching was real: LibVortex's TLS
 //! transport never reported what OpenSSL still held decrypted, so a TLS record carrying more
@@ -64,13 +65,12 @@ async fn the_c_client_tunes_a_vortice_listener_for_tls() {
         "port {port} is taken; a stray listener would answer for this one"
     );
 
-    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-        .expect("generate a certificate");
-    let tls = vortice_tls::server_config(
-        issued.cert.pem().as_bytes(),
-        issued.signing_key.serialize_pem().as_bytes(),
-    )
-    .expect("server configuration");
+    // `test_05a2` pins the MD5 digest of this exact certificate, so it has to be this one.
+    let certificate = std::fs::read(suite.test_dir().join("test-certificate.pem"))
+        .expect("the suite ships test-certificate.pem");
+    let key = std::fs::read(suite.test_dir().join("test-private-key.pem"))
+        .expect("the suite ships test-private-key.pem");
+    let tls = vortice_tls::server_config(&certificate, &key).expect("server configuration");
 
     // The /5 profile serves files the client names, relative to the working directory.
     std::env::set_current_dir(suite.test_dir()).expect("the suite directory should exist");
@@ -94,7 +94,15 @@ async fn the_c_client_tunes_a_vortice_listener_for_tls() {
         .expect("bind the Vortice listener");
     let serving = tokio::spawn(server.serve());
 
-    let tests = ["test_05"];
+    // `test_05a2` asks the tuned connection for the peer certificate and checks its digest,
+    // which is a listener test in everything but name: what it proves is that the certificate
+    // the listener presented is the one it was configured with, intact across the swap.
+    //
+    // `test_05c` tunes with a `serverName` and then asks the listener, over the tuned
+    // connection, what name it sees. Answering needs the session to have kept it across the
+    // swap — the channel that named it is the one that asked for TLS, and both are gone by
+    // the time the question arrives.
+    let tests = ["test_05", "test_05a2", "test_05c"];
     let run = tokio::time::timeout(
         Duration::from_secs(180),
         tokio::task::spawn_blocking(move || suite.run_client(&tests)),
