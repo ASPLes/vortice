@@ -258,6 +258,23 @@ impl Responder {
         self.session
     }
 
+    /// The virtual host the peer named when it opened the session, if it named one.
+    ///
+    /// The same value [`Connection::server_name`](crate::Connection::server_name) reports: a
+    /// profile serving several names asks here which one it is being asked about.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] when the session is gone.
+    pub async fn server_name(&self) -> Result<Option<String>> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::ServerName { reply })
+            .await
+            .map_err(|_| Error::Closed)?;
+        answer.await.map_err(|_| Error::Closed)
+    }
+
     /// Replies to `msgno` and then replaces the transport, as one step.
     ///
     /// The listening half of [`Connection::upgrade`](crate::Connection::upgrade), and the

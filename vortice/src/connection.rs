@@ -87,6 +87,9 @@ pub(crate) enum Command {
     CloseSession {
         reply: oneshot::Sender<Result<()>>,
     },
+    ServerName {
+        reply: oneshot::Sender<Option<String>>,
+    },
     SetWindowSize {
         channel: u32,
         size: u32,
@@ -271,6 +274,25 @@ impl Connection {
             .await
             .map_err(|_| Error::Closed)?;
         answer.await.map_err(|_| Error::Closed)?
+    }
+
+    /// The virtual host the peer said it was connecting to, if it said one.
+    ///
+    /// This is `vortex_connection_get_server_name`: the `serverName` attribute of the first
+    /// `<start>` that carried one, which RFC3080 §2.3.1.2 makes a property of the session
+    /// rather than of the channel that mentioned it. It survives a transport swap, because
+    /// tuning replaces the session and not the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] when the session is gone.
+    pub async fn server_name(&self) -> Result<Option<String>> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::ServerName { reply })
+            .await
+            .map_err(|_| Error::Closed)?;
+        answer.await.map_err(|_| Error::Closed)
     }
 
     /// Closes the session, waiting for the peer to accept.
@@ -610,7 +632,13 @@ impl Driver {
             }
         }
 
+        let server_name = self.session.server_name().map(ToOwned::to_owned);
         self.session = Session::new(config);
+        // The channels go, the connection stays: whatever the peer said it was connecting to
+        // is still true on the other side of the handshake.
+        if let Some(name) = server_name {
+            self.session.set_server_name(name);
+        }
         self.routes.reset();
         self.served.clear();
         self.awaiting_upgrade = false;
@@ -670,6 +698,9 @@ impl Driver {
                     .send(channel, kind, msgno, ansno, with_mime(&payload))
                     .map_err(Error::from);
                 let _ = reply.send(result);
+            }
+            Command::ServerName { reply } => {
+                let _ = reply.send(self.session.server_name().map(ToOwned::to_owned));
             }
             Command::SetWindowSize {
                 channel,
