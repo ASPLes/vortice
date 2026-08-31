@@ -29,7 +29,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::error::Error;
 use crate::frame::{DataFrame, FrameKind, MAX_FRAME_SIZE, MAX_MSG_NO, SeqFrame};
-use crate::window::{DEFAULT_WINDOW_SIZE, SeqNo, Window};
+use crate::window::{INITIAL_WINDOW_SIZE, SeqNo, Window};
 
 /// What one call to [`Channel::emit`] produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,19 +99,25 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Opens a channel with the default window in both directions.
+    /// Opens a channel with the window RFC3081 starts every channel at, in both directions.
     #[must_use]
     pub fn new(number: u32, profile: impl Into<String>) -> Self {
-        Self::with_window_size(number, profile, DEFAULT_WINDOW_SIZE)
+        Self::with_window_size(number, profile, INITIAL_WINDOW_SIZE)
     }
 
-    /// Opens a channel advertising `window_size` octets in both directions.
+    /// Opens a channel offering `window_size` octets for **incoming** traffic.
+    ///
+    /// The outgoing direction is not this end's to choose: until the peer sends a `SEQ` the
+    /// only thing known about it is RFC3081 §3.1.3's [`INITIAL_WINDOW_SIZE`], and writing
+    /// more than that on the strength of a local setting would put octets on the wire the
+    /// peer never offered to take. So `window_size` governs the receiving side alone, and
+    /// the sending side starts where the specification says it starts.
     #[must_use]
     pub fn with_window_size(number: u32, profile: impl Into<String>, window_size: u32) -> Self {
         Self {
             number,
             profile: profile.into(),
-            send_window: Window::new(SeqNo::ZERO, window_size),
+            send_window: Window::new(SeqNo::ZERO, INITIAL_WINDOW_SIZE),
             next_seqno: SeqNo::ZERO,
             next_msgno: 0,
             outstanding: BTreeSet::new(),
@@ -559,9 +565,21 @@ mod tests {
         assert_eq!(more, [true, true, true, false]);
     }
 
+    /// Offering a large window for what arrives must not make this end write more than the
+    /// peer has offered to take. Until a `SEQ` arrives that is RFC3081's 4096 octets, whatever
+    /// this end advertises for its own receiving.
+    #[test]
+    fn a_large_advertised_window_does_not_widen_the_sending_side() {
+        let channel = Channel::with_window_size(1, "urn:a", 32768);
+        assert_eq!(channel.writable(), INITIAL_WINDOW_SIZE);
+        assert_eq!(channel.recv_window().size(), 32768);
+    }
+
+    /// The send window is the peer's to set, so the test sets it the only way a peer can.
     #[test]
     fn stops_at_the_window_and_hands_back_the_rest() {
-        let mut channel = Channel::with_window_size(1, "urn:a", 1024);
+        let mut channel = Channel::new(1, "urn:a");
+        channel.apply_seq(&SeqFrame::new(1, 0, 1024).unwrap());
         let emitted = channel
             .emit(FrameKind::Msg, 0, None, payload(4096), 4096)
             .unwrap();
@@ -575,7 +593,8 @@ mod tests {
 
     #[test]
     fn resumes_once_a_seq_frame_reopens_the_window() {
-        let mut channel = Channel::with_window_size(1, "urn:a", 1024);
+        let mut channel = Channel::new(1, "urn:a");
+        channel.apply_seq(&SeqFrame::new(1, 0, 1024).unwrap());
         let first = channel
             .emit(FrameKind::Msg, 0, None, payload(2048), 4096)
             .unwrap();

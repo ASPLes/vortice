@@ -113,14 +113,19 @@ pub struct Window {
     size: u32,
 }
 
-/// Window size a channel starts with, matching the LibVortex default.
-pub const DEFAULT_WINDOW_SIZE: u32 = 4096;
+/// Window every channel starts with, before any `SEQ` frame says otherwise.
+///
+/// RFC3081 §3.1.3 fixes this at 4096 octets: it is what each end may assume the other will
+/// take on a channel that has just opened, so it is not a preference and must not be raised
+/// on the sending side. What an end is willing to *receive* is its own choice, announced
+/// with a `SEQ` — see [`Config::window_size`](crate::session::Config::window_size).
+pub const INITIAL_WINDOW_SIZE: u32 = 4096;
 
 impl Default for Window {
     fn default() -> Self {
         Self {
             base: SeqNo::ZERO,
-            size: DEFAULT_WINDOW_SIZE,
+            size: INITIAL_WINDOW_SIZE,
         }
     }
 }

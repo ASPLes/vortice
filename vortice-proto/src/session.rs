@@ -39,7 +39,7 @@ use crate::error::Error;
 use crate::frame::{DataFrame, Frame, FrameKind, SeqFrame};
 use crate::greeting::{GREETING_CHANNEL, Greeting};
 use crate::management::{Close, ErrorReply, Message as Management, Profile, Start, code};
-use crate::window::DEFAULT_WINDOW_SIZE;
+use crate::window::INITIAL_WINDOW_SIZE;
 
 /// Which end of the session this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,11 +151,29 @@ pub struct Config {
     pub role: Role,
     /// The greeting to announce.
     pub greeting: Greeting,
-    /// Window advertised on every channel, in octets.
+    /// Window advertised on every channel for **incoming** traffic, in octets.
+    ///
+    /// This is what this end offers to receive, announced with a `SEQ` as soon as the
+    /// channel exists. It says nothing about how much may be written: that is the peer's to
+    /// offer, and starts at [`INITIAL_WINDOW_SIZE`] until it says otherwise.
+    ///
+    /// The default is [`DEFAULT_WINDOW_SIZE`], eight times the value RFC3081 starts a
+    /// channel at. A 4096 octet window is small enough that an ordinary payload does not fit
+    /// in what is left of it: a 4096 octet answer carrying even an empty MIME header is 4098
+    /// octets, so every one of them is cut in two, doubling the frame count and putting a two
+    /// octet frame behind every full one. Peers are free to advertise whatever they like —
+    /// LibVortex enlarges its own — and nothing here depends on the value.
     pub window_size: u32,
     /// Largest payload put in a single frame.
     pub max_frame_size: u32,
 }
+
+/// Window this end advertises for incoming traffic when nothing says otherwise.
+///
+/// Not the same thing as [`INITIAL_WINDOW_SIZE`], which is fixed by the specification and
+/// governs what may be *written* before the peer has spoken. See
+/// [`Config::window_size`].
+pub const DEFAULT_WINDOW_SIZE: u32 = 32768;
 
 impl Config {
     /// A configuration for the given role, advertising no profiles.
@@ -165,7 +183,7 @@ impl Config {
             role,
             greeting: Greeting::new(),
             window_size: DEFAULT_WINDOW_SIZE,
-            max_frame_size: DEFAULT_WINDOW_SIZE,
+            max_frame_size: INITIAL_WINDOW_SIZE,
         }
     }
 
@@ -226,6 +244,8 @@ pub struct Session {
     held_replies: BTreeMap<u32, BTreeMap<u32, VecDeque<Queued>>>,
     half_open: BTreeMap<u32, Profile>,
     unacked: BTreeMap<u32, u32>,
+    /// The virtual host this session is for, from the first `<start>` that named one.
+    server_name: Option<String>,
 
     next_channel: u32,
     outbound: BytesMut,
@@ -251,6 +271,7 @@ impl Session {
             held_replies: BTreeMap::new(),
             half_open: BTreeMap::new(),
             unacked: BTreeMap::new(),
+            server_name: None,
             outbound: BytesMut::new(),
             events: VecDeque::new(),
         };
@@ -262,7 +283,44 @@ impl Session {
         session
             .flush(GREETING_CHANNEL)
             .expect("a fresh channel 0 cannot fail to emit");
+        // After the greeting, never before it: a `SEQ` is legal at any moment, but a peer
+        // reading its first octets from a session expects a greeting there, and interop is
+        // not the place to find out which ones mind.
+        session.advertise_window(GREETING_CHANNEL);
         session
+    }
+
+    /// Tells the peer how much this end will take on `number`, when that is more than the
+    /// window RFC3081 starts it at.
+    ///
+    /// Without this the offer is private: the peer keeps to its 4096 octets and only learns
+    /// better once half of a window it cannot fill has been consumed, which is never. One
+    /// `SEQ` of seventeen octets settles it.
+    ///
+    /// Used for channel 0 only, and there it follows the greeting. Other channels learn of
+    /// the offer through the first acknowledgement instead, which carries the same figure —
+    /// and that is deliberate rather than lazy. The octets immediately after a channel is
+    /// opened are not always BEEP: the TLS profile replies on the tuning channel and then
+    /// replaces the transport underneath, so a `SEQ` emitted around that reply lands in the
+    /// middle of a handshake and ends the session. It is a trap this project has already
+    /// walked into once from the other direction, and `vortice/tests/upgrade.rs` catches it.
+    fn advertise_window(&mut self, number: u32) {
+        if self.config.window_size <= INITIAL_WINDOW_SIZE {
+            return;
+        }
+        let channel = if number == GREETING_CHANNEL {
+            &self.zero
+        } else {
+            let Some(channel) = self.channels.get(&number) else {
+                return;
+            };
+            channel
+        };
+        // A window too large to render is a configuration error, not a wire condition: the
+        // channel keeps the offer it was built with and the peer keeps the initial one.
+        if let Ok(seq) = channel.recv_window().to_seq_frame(number) {
+            seq.encode(&mut self.outbound);
+        }
     }
 
     /// How far the session has got.
@@ -296,6 +354,25 @@ impl Session {
             return None;
         }
         Some(self.outbound.split().freeze())
+    }
+
+    /// The virtual host this session is for, if the peer named one.
+    ///
+    /// This is `vortex_connection_get_server_name`. It comes from the `serverName` attribute
+    /// of the first `<start>` that carried it, and does not change afterwards.
+    #[must_use]
+    pub fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
+    }
+
+    /// Carries the virtual host into a session that replaces this one.
+    ///
+    /// Tuning starts a new session, but not a new connection: RFC3080 §3.1 discards the
+    /// channels, not what the peer said it was connecting to. Without this the name is lost
+    /// exactly when a profile is most likely to want it, since the channel that named it is
+    /// usually the one that asked for TLS.
+    pub fn set_server_name(&mut self, name: impl Into<String>) {
+        self.server_name = Some(name.into());
     }
 
     /// The next thing that happened, or `None` when nothing is queued.
@@ -407,6 +484,16 @@ impl Session {
     ) -> Result<(), Error> {
         match (kind, management) {
             (FrameKind::Msg, Management::Start(start)) => {
+                // RFC3080 §2.3.1.2: the `serverName` attribute names the virtual host this
+                // session is for, and it is the *first* channel that decides it — later
+                // starts may carry one, and it is ignored. Remembering it is what makes
+                // `vortex_connection_get_server_name` answerable, and what a profile serving
+                // several names needs in order to know which it is being asked about.
+                if self.server_name.is_none()
+                    && let Some(name) = &start.server_name
+                {
+                    self.server_name = Some(name.clone());
+                }
                 self.events.push_back(Event::StartRequested {
                     channel: start.number,
                     msgno,
@@ -807,6 +894,13 @@ impl Session {
     /// so the window is reopened once half of it has been consumed — the same trade
     /// `vortex_channel_update_incoming_buffer` makes.
     fn acknowledge(&mut self, number: u32, octets: u32) -> Result<(), Error> {
+        if number != GREETING_CHANNEL && !self.channels.contains_key(&number) {
+            return Ok(());
+        }
+        let pending = self.unacked.entry(number).or_insert(0);
+        *pending = pending.saturating_add(octets);
+        let pending_now = *pending;
+
         let channel = if number == GREETING_CHANNEL {
             &mut self.zero
         } else {
@@ -815,12 +909,16 @@ impl Session {
             };
             channel
         };
-        let pending = self.unacked.entry(number).or_insert(0);
-        *pending = pending.saturating_add(octets);
-        let threshold = (channel.recv_window().size() / 2).max(1);
-        if *pending >= threshold {
-            let seq = channel.consume(*pending)?;
-            *pending = 0;
+        // Half the window offered, but never less often than half of what the peer is
+        // entitled to assume. A peer that has not yet been told about the wider window keeps
+        // to RFC3081's 4096 octets and stalls there; acknowledging only at half of a window
+        // it does not know about would leave it waiting for a `SEQ` that never comes. The
+        // frame this sends carries the offered size, so the first acknowledgement is also
+        // where the peer learns how much room there really is.
+        let threshold = (channel.recv_window().size() / 2).clamp(1, INITIAL_WINDOW_SIZE / 2);
+        if pending_now >= threshold {
+            let seq = channel.consume(pending_now)?;
+            self.unacked.insert(number, 0);
             seq.encode(&mut self.outbound);
         }
         Ok(())
@@ -947,6 +1045,65 @@ mod tests {
             );
             number
         }
+    }
+
+    /// A window worth having is a window the peer knows about.
+    #[test]
+    fn announces_the_advertised_window_on_every_channel() {
+        let mut session = Session::new(Config::new(Role::Listener).with_profile(ECHO));
+        let mut wire = alloc::vec::Vec::new();
+        while let Some(bytes) = session.poll_transmit() {
+            wire.extend_from_slice(&bytes);
+        }
+        let opening = String::from_utf8_lossy(&wire).into_owned();
+        assert!(
+            opening.contains(&alloc::format!("SEQ 0 0 {DEFAULT_WINDOW_SIZE}\r\n")),
+            "channel 0's window was never announced: {opening}"
+        );
+        assert!(
+            opening.starts_with("RPY 0 0 . 0 "),
+            "the greeting must come first: {opening}"
+        );
+
+        // On any other channel the offer travels with the first acknowledgement, so it takes
+        // half of the peer's initial window of traffic to arrive. Before that both ends keep
+        // to RFC3081's figure, which is what makes the tuning channel safe.
+        let mut pair = Pair::new();
+        let number = pair.open_channel();
+        assert_eq!(
+            pair.initiator.channels[&number].send_window().size(),
+            INITIAL_WINDOW_SIZE,
+            "nothing has been received yet, so nothing has been announced"
+        );
+
+        pair.initiator
+            .send(
+                number,
+                FrameKind::Msg,
+                0,
+                None,
+                Bytes::from(alloc::vec![b'x'; 2048]),
+            )
+            .unwrap();
+        pair.pump();
+        assert_eq!(
+            pair.initiator.channels[&number].send_window().size(),
+            DEFAULT_WINDOW_SIZE,
+            "half the initial window went by, so the listener said how much room it has"
+        );
+    }
+
+    /// What this end offers to receive says nothing about what it may write. Until the peer
+    /// sends a `SEQ`, that is RFC3081's initial window and nothing else.
+    #[test]
+    fn a_wide_advertised_window_does_not_widen_what_is_written() {
+        let listener = Session::new(
+            Config::new(Role::Listener)
+                .with_profile(ECHO)
+                .with_window_size(65536),
+        );
+        // Not `writable()`: the greeting has already been charged against it.
+        assert_eq!(listener.zero.send_window().size(), INITIAL_WINDOW_SIZE);
     }
 
     #[test]
