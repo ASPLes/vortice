@@ -26,6 +26,9 @@ use std::time::{Duration, SystemTime};
 /// How long to wait between attempts.
 const RETRY: Duration = Duration::from_millis(200);
 
+/// How often the wait is announced, so a blocked run says why rather than looking hung.
+const ANNOUNCE_EVERY: Duration = Duration::from_secs(10);
+
 /// After this, a lock is assumed to belong to a process that died holding it.
 ///
 /// Generous on purpose: the whole point is to serialise runs that take minutes, so the cost of
@@ -59,6 +62,7 @@ impl SuiteLock {
 
     /// As [`SuiteLock::acquire`], on a named lock. Private: one suite, one lock.
     fn acquire_at(path: PathBuf) -> Self {
+        let mut waited = Duration::ZERO;
         loop {
             match fs::create_dir(&path) {
                 Ok(()) => return Self { path },
@@ -69,8 +73,26 @@ impl SuiteLock {
                             path.display()
                         );
                         let _ = fs::remove_dir(&path);
+                    } else if waited.as_secs() % ANNOUNCE_EVERY.as_secs() == 0
+                        && waited.subsec_millis() == 0
+                    {
+                        // Say so, and keep saying so. A test that simply sits there for a
+                        // quarter of an hour looks like the thing it is testing has hung, and
+                        // the usual reason is not another run at all: it is a run that was
+                        // killed — by a timeout, by Ctrl-C — leaving the directory behind.
+                        // An afternoon went into diagnosing a stalled interop test that was
+                        // only ever waiting here.
+                        eprintln!(
+                            "vortice-interop: waiting for the suite lock at {} ({}s so far; \
+                             it is broken automatically after {}s, or remove it by hand if no \
+                             other interop run is going)",
+                            path.display(),
+                            waited.as_secs(),
+                            STALE_AFTER.as_secs(),
+                        );
                     }
                     sleep(RETRY);
+                    waited += RETRY;
                 }
                 Err(error) => {
                     // Nothing to serialise against if the lock cannot be created at all —

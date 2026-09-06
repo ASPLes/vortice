@@ -281,7 +281,12 @@ impl Handler for PiggybackUpgrade {
         Box::pin(core::future::ready(()))
     }
 
-    fn accept(&self, uri: &str, _start: &Start) -> Result<Profile, vortice::ErrorReply> {
+    fn accept(
+        &self,
+        _session: vortice::SessionId,
+        uri: &str,
+        _start: &Start,
+    ) -> Result<Profile, vortice::ErrorReply> {
         Ok(Profile::new(uri).with_content("<proceed />"))
     }
 

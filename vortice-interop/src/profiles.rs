@@ -15,14 +15,21 @@
 //! `/ans-nul-reply-close` needs a connection-accepted hook, which Vortice does not have yet.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use vortice::{AlwaysRefuse, Handler, HandlerFuture, Message, Responder, Router, SessionId, code};
+use vortice::{
+    AlwaysRefuse, ErrorReply, Handler, HandlerFuture, Message, Profile, Responder, Router,
+    SessionId, Start, code,
+};
 
 const ECHO: &str = "http://iana.org/beep/transient/vortex-regression";
 const ECHO_2: &str = "http://iana.org/beep/transient/vortex-regression/2";
 const ECHO_3: &str = "http://iana.org/beep/transient/vortex-regression/3";
 const DENY_SUPPORTED: &str = "http://iana.org/beep/transient/vortex-regression/deny_supported";
+
+/// Opening a channel here makes the listener refuse the next request to tune for TLS.
+const BLOCK_TLS: &str = "http://iana.org/beep/transient/vortex-regression/block-tls";
 
 /// An echo under a second name, which `test_01a` uses to push zeroed binary payloads.
 ///
@@ -316,4 +323,45 @@ pub fn regression_router() -> Router {
             DENY_SUPPORTED,
             AlwaysRefuse::with_text(code::SERVICE_NOT_AVAILABLE, "channel refused on purpose"),
         )
+        .profile(BLOCK_TLS, BlockTls)
+}
+
+/// Whether the next request to tune for TLS is to be refused.
+///
+/// Process-wide, and deliberately so: it is what the C listener does with
+/// `enable_block_tls_queries`, and `test_05a` depends on that reach — it opens the channel on
+/// one connection and then checks that a *different* connection cannot tune. A flag per
+/// session would pass the first half of that test and fail the second.
+static BLOCK_NEXT_TLS: AtomicBool = AtomicBool::new(false);
+
+/// Takes the flag down, reporting what it was.
+///
+/// For the TLS policy to call when a peer asks to tune: the block is spent on one attempt,
+/// exactly as `regression_tls_handle_query` spends it.
+#[must_use]
+pub fn take_block_tls() -> bool {
+    BLOCK_NEXT_TLS.swap(false, Ordering::SeqCst)
+}
+
+/// The `/block-tls` profile: opening a channel on it arms [`take_block_tls`].
+#[derive(Debug, Clone, Copy)]
+struct BlockTls;
+
+impl Handler for BlockTls {
+    fn handle(&self, _responder: Responder, _message: Message) -> HandlerFuture {
+        Box::pin(std::future::ready(()))
+    }
+
+    fn accept(
+        &self,
+        _session: SessionId,
+        uri: &str,
+        _start: &Start,
+    ) -> Result<Profile, ErrorReply> {
+        // At the start rather than once the channel is open, which is where the C listener
+        // does it (`start_channel_block_tls`): the client sends the TLS start immediately
+        // after this one and the flag has to be up by then.
+        BLOCK_NEXT_TLS.store(true, Ordering::SeqCst);
+        Ok(Profile::new(uri))
+    }
 }
