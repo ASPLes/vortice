@@ -66,10 +66,20 @@ pub trait Handler: Send + Sync + 'static {
     /// The default accepts, echoing the URI back with no piggybacked content. Returning an
     /// error refuses the channel with that code and text.
     ///
+    /// `session` names the connection asking, which is what a profile keeping state per peer
+    /// needs — the same identity [`Responder::session`] reports, and stable across a
+    /// transport swap, since tuning replaces the session and not the connection.
+    ///
     /// # Errors
     ///
     /// Whatever the profile wants the peer to be told.
-    fn accept(&self, uri: &str, _start: &Start) -> std::result::Result<Profile, ErrorReply> {
+    fn accept(
+        &self,
+        session: SessionId,
+        uri: &str,
+        start: &Start,
+    ) -> std::result::Result<Profile, ErrorReply> {
+        let _ = (session, start);
         Ok(Profile::new(uri))
     }
 
@@ -142,7 +152,12 @@ impl Handler for AlwaysRefuse {
         Box::pin(std::future::ready(()))
     }
 
-    fn accept(&self, _uri: &str, _start: &Start) -> std::result::Result<Profile, ErrorReply> {
+    fn accept(
+        &self,
+        _session: SessionId,
+        _uri: &str,
+        _start: &Start,
+    ) -> std::result::Result<Profile, ErrorReply> {
         let mut error = ErrorReply::new(self.code);
         if let Some(text) = &self.text {
             error = ErrorReply::new(self.code).with_text(text.clone(), None);

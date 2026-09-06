@@ -494,33 +494,24 @@ impl Driver {
             read.reserve(READ_CHUNK);
 
             if self.awaiting_upgrade {
-                // Write and take commands, but do not read: see the field's documentation.
-                if self.out.is_empty() {
-                    match self.commands.recv().await {
-                        Some(command) => self.dispatch(command, ready).await?,
-                        None => return Ok(()),
-                    }
-                } else {
-                    let written = {
-                        let writer = &mut self.io.writer;
-                        let commands = &mut self.commands;
-                        let out = &self.out;
-                        tokio::select! {
-                            command = commands.recv() => Progress::Command(command),
-                            result = writer.write(out) => Progress::Wrote(result?),
-                        }
-                    };
-                    match written {
-                        Progress::Command(Some(command)) => self.dispatch(command, ready).await?,
-                        Progress::Command(None) => return Ok(()),
-                        Progress::Wrote(n) => {
-                            self.out.advance(n);
-                            if self.out.is_empty() {
-                                self.io.writer.flush().await?;
-                            }
-                        }
-                        Progress::Read(_) => {}
-                    }
+                // Neither read nor write: take commands and nothing else.
+                //
+                // Not reading is the older half of this, and the reason is the peer's
+                // handshake octets — fed to a BEEP parser they end the session. Not writing
+                // was added later and matters just as much, because what is sitting in `out`
+                // is the reply accepting the tuning: let that go now and the peer starts its
+                // handshake against a listener that has not swapped yet and may not be ready
+                // to, which is exactly the state a profile that takes its time before
+                // agreeing leaves the connection in. LibVortex's own listener decides first
+                // and answers afterwards, and a C client left mid-handshake by a listener
+                // that answered too early has been seen to die on a later connection.
+                //
+                // Nothing is lost by waiting: `upgrade` flushes everything queued here before
+                // it touches the transport, so the acceptance and the swap reach the peer as
+                // the one indivisible step they are supposed to be.
+                match self.commands.recv().await {
+                    Some(command) => self.dispatch(command, ready).await?,
+                    None => return Ok(()),
                 }
                 continue;
             }
@@ -742,7 +733,7 @@ impl Driver {
             );
             return;
         };
-        match handler.accept(&uri, start) {
+        match handler.accept(self.id, &uri, start) {
             Ok(profile) => {
                 if self.session.accept_start(channel, msgno, profile).is_ok() {
                     self.awaiting_upgrade |= handler.upgrades_transport();
