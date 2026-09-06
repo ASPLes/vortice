@@ -75,6 +75,7 @@ mod error;
 mod implicit;
 
 use std::io;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -82,7 +83,7 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use vortice::{
     BoxedTransport, Config, Connection, ErrorReply, Greeting, Handler, HandlerFuture, Message,
-    Profile, Responder, Start, code,
+    Profile, Responder, SessionId, Start, code,
 };
 
 pub use error::{Error, Result};
@@ -182,7 +183,56 @@ pub async fn upgrade<'a>(
 pub struct TlsProfile {
     acceptor: TlsAcceptor,
     after: Config,
+    policy: Arc<dyn TlsPolicy>,
 }
+
+/// What a listener decides when a peer asks to tune the session.
+///
+/// This is `vortex_tls_accept_negotiation`'s accept handler, and it exists for the same
+/// reasons: a listener may serve TLS to some peers and not others, may need the `serverName`
+/// to pick a certificate, and may have to ask something else before it can agree.
+///
+/// The decision is split in two because the two halves happen at different moments and only
+/// one of them can still say no:
+///
+/// - [`TlsPolicy::accept`] runs on the `<start>`, synchronously, and is the only place a
+///   refusal is possible. Refusing writes an `<error>` and leaves the session running in the
+///   clear, which is what RFC3080 §3.1 expects of a tuning attempt that is declined.
+/// - [`TlsPolicy::proceed`] runs after that, before `<proceed/>` reaches the peer, and may
+///   await. It is where work that has to happen before agreeing goes — looking a certificate
+///   up, asking a policy server. Returning `false` there means the listener agreed and then
+///   could not go through with it: the handshake fails and the session ends, which is the
+///   only honest outcome once `<proceed/>` is on the wire.
+pub trait TlsPolicy: Send + Sync + 'static {
+    /// Whether to tune at all, decided from the `<start>` that asked and from which peer.
+    ///
+    /// # Errors
+    ///
+    /// The [`ErrorReply`] to send instead of the acceptance.
+    fn accept(&self, session: SessionId, start: &Start) -> std::result::Result<(), ErrorReply> {
+        let _ = (session, start);
+        Ok(())
+    }
+
+    /// Work to do before the acceptance reaches the peer, and a last chance to abandon.
+    ///
+    /// `false` fails the handshake, and with it the session.
+    fn proceed(&self, session: SessionId, server_name: Option<String>) -> TlsDecision {
+        let _ = (session, server_name);
+        Box::pin(core::future::ready(true))
+    }
+}
+
+/// What [`TlsPolicy::proceed`] answers with, once it has finished deciding.
+pub type TlsDecision = Pin<Box<dyn Future<Output = bool> + Send>>;
+
+/// The policy a [`TlsProfile`] has when none is given: tune with anyone who asks.
+///
+/// What LibVortex does when `vortex_tls_accept_negotiation` is passed no accept handler.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AcceptAll;
+
+impl TlsPolicy for AcceptAll {}
 
 impl core::fmt::Debug for TlsProfile {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -194,12 +244,23 @@ impl core::fmt::Debug for TlsProfile {
 
 impl TlsProfile {
     /// Serves TLS with `tls`, and runs the session that follows with `after`.
+    ///
+    /// Tunes with anyone who asks; see [`TlsProfile::with_policy`] for a listener that does
+    /// not.
     #[must_use]
     pub fn new(tls: ServerConfig, after: Config) -> Self {
         Self {
             acceptor: TlsAcceptor::from(Arc::new(tls)),
             after,
+            policy: Arc::new(AcceptAll),
         }
+    }
+
+    /// Puts a [`TlsPolicy`] in charge of who gets tuned.
+    #[must_use]
+    pub fn with_policy(mut self, policy: impl TlsPolicy) -> Self {
+        self.policy = Arc::new(policy);
+        self
     }
 }
 
@@ -210,7 +271,12 @@ impl Handler for TlsProfile {
         Box::pin(core::future::ready(()))
     }
 
-    fn accept(&self, uri: &str, start: &Start) -> std::result::Result<Profile, ErrorReply> {
+    fn accept(
+        &self,
+        session: SessionId,
+        uri: &str,
+        start: &Start,
+    ) -> std::result::Result<Profile, ErrorReply> {
         let offered = start
             .profiles
             .iter()
@@ -225,6 +291,7 @@ impl Handler for TlsProfile {
                 None,
             ));
         }
+        self.policy.accept(session, start)?;
         Ok(Profile::new(uri).with_content(PROCEED))
     }
 
@@ -235,13 +302,33 @@ impl Handler for TlsProfile {
     fn on_open(&self, responder: Responder) -> HandlerFuture {
         let acceptor = self.acceptor.clone();
         let after = self.after.clone();
+        let policy = Arc::clone(&self.policy);
         Box::pin(async move {
-            let outcome = responder
-                .upgrade(after, move |io| async move {
-                    let stream = acceptor.accept(io).await.map_err(vortice::Error::Io)?;
-                    Ok(Box::pin(stream) as BoxedTransport)
-                })
-                .await;
+            // Nothing has reached the peer yet: `<proceed/>` travels with the upgrade below,
+            // which is what makes the reply and the swap one indivisible step. So this is the
+            // last moment at which the listener can still take its time, or think better of
+            // it.
+            let server_name = responder.server_name().await.ok().flatten();
+            let session = responder.session();
+            let outcome = if policy.proceed(session, server_name).await {
+                responder
+                    .upgrade(after, move |io| async move {
+                        let stream = acceptor.accept(io).await.map_err(vortice::Error::Io)?;
+                        Ok(Box::pin(stream) as BoxedTransport)
+                    })
+                    .await
+            } else {
+                // Agreed and then could not go through with it, which is what a listener that
+                // fails to build its TLS context does. The peer is already committed to a
+                // handshake, so there is nothing to say to it in BEEP: the session ends.
+                responder
+                    .upgrade(after, move |_io| async move {
+                        Err(vortice::Error::Io(std::io::Error::other(
+                            "the listener could not go through with the negotiation",
+                        )))
+                    })
+                    .await
+            };
             if let Err(error) = outcome {
                 tracing::debug!(%error, "TLS negotiation failed");
             }

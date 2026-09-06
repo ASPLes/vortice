@@ -32,6 +32,11 @@ use vortice_interop::profiles::regression_router;
 use vortice_interop::{LibVortex, SuiteLock};
 use vortice_tls::{PROFILE_URI, TlsProfile};
 
+#[path = "common/tls_policy.rs"]
+mod tls_policy;
+
+use tls_policy::RegressionTlsPolicy;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_c_client_tunes_a_vortice_listener_for_tls() {
     // Only one interop test may drive the suite at a time, whichever crate it lives in:
@@ -87,7 +92,10 @@ async fn the_c_client_tunes_a_vortice_listener_for_tls() {
         after.greeting = after.greeting.clone().with_profile(uri.as_str());
     }
 
-    let router: Router = regression_router().profile(PROFILE_URI, TlsProfile::new(tls, after));
+    let router: Router = regression_router().profile(
+        PROFILE_URI,
+        TlsProfile::new(tls, after).with_policy(RegressionTlsPolicy::default()),
+    );
 
     let server = Server::bind_with(("0.0.0.0", port), Config::new(Role::Listener), router)
         .await
@@ -102,9 +110,17 @@ async fn the_c_client_tunes_a_vortice_listener_for_tls() {
     // connection, what name it sees. Answering needs the session to have kept it across the
     // swap — the channel that named it is the one that asked for TLS, and both are gone by
     // the time the question arrives.
-    let tests = ["test_05", "test_05a2", "test_05c"];
+    let tests = [
+        "test_05",
+        "test_05a",
+        "test_05a1",
+        "test_05a2",
+        "test_05b",
+        "test_05c",
+        "test_05d",
+    ];
     let run = tokio::time::timeout(
-        Duration::from_secs(180),
+        Duration::from_secs(300),
         tokio::task::spawn_blocking(move || suite.run_client(&tests)),
     )
     .await

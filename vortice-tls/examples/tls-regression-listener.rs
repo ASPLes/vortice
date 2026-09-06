@@ -10,12 +10,17 @@
 //! ```sh
 //! cd ~/programas/libvortex-1.1/test
 //! cargo run -p vortice-tls --example tls-regression-listener -- --offset-port=1000
-//! ./vortex-regression-client --offset-port=1000 --run-test=test_05
+//! ./vortex-regression-client --offset-port=1000 --run-test=test_05,test_05a,test_05d
 //! ```
 
 use vortice::{Config, Role, Server};
 use vortice_interop::profiles::regression_router;
 use vortice_tls::{PROFILE_URI, TlsProfile};
+
+#[path = "../tests/common/tls_policy.rs"]
+mod tls_policy;
+
+use tls_policy::RegressionTlsPolicy;
 
 /// Base port the suite's main listener uses, before any offset.
 const BASE_PORT: u16 = 44010;
@@ -34,12 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or(Ok(0), |value| value.parse())?;
     let port = BASE_PORT + offset;
 
-    // Generated rather than read from the suite: its own certificate is a 1024-bit RSA key
-    // signed with SHA-1 that expired in 2021, none of which rustls will load.
-    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+    // The suite's own, because `test_05a2` pins its MD5 digest. Run from the suite's test
+    // directory, as the usage above shows.
     let tls = vortice_tls::server_config(
-        issued.cert.pem().as_bytes(),
-        issued.signing_key.serialize_pem().as_bytes(),
+        &std::fs::read("test-certificate.pem")?,
+        &std::fs::read("test-private-key.pem")?,
     )?;
 
     // The session after tuning starts again from nothing, so it has to offer the profiles the
@@ -51,7 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         after.greeting = after.greeting.clone().with_profile(uri.as_str());
     }
 
-    let router = regression_router().profile(PROFILE_URI, TlsProfile::new(tls, after));
+    let router = regression_router().profile(
+        PROFILE_URI,
+        TlsProfile::new(tls, after).with_policy(RegressionTlsPolicy::default()),
+    );
 
     let server = Server::bind_with(("0.0.0.0", port), Config::new(Role::Listener), router).await?;
     println!("Vortice TLS regression listener on port {port} (offset {offset})");
