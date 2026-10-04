@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Advanced Software Production Line, S.L.
 // SPDX-License-Identifier: LGPL-2.1-only
 
-//! The BEEP TLS profile, RFC3080 §3.1.
+//! The BEEP TLS profile, RFC3080 §3.1, over rustls or `native-tls`.
 //!
 //! BEEP's TLS is not implicit TLS. A session begins in the clear, and either end may then ask
 //! to tune it: a channel is started offering `http://iana.org/beep/TLS` with `<ready />`
@@ -68,27 +68,50 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Which TLS library
+//!
+//! Two, and neither is the profile's business. The negotiation above is XML on a channel; the
+//! only step that involves TLS at all is the swap, and all it asks of a library is to turn a
+//! transport into an encrypted one. That is [`backend::Acceptor`] and [`backend::Connector`],
+//! one method each.
+//!
+//! - **`rustls`**, the default feature, and what the interop tests run against.
+//! - **`native-tls`**, the platform's own — OpenSSL, Secure Transport, SChannel — in the
+//!   `native` module, for a deployment that has already decided what its TLS is.
+//!
+//! They are not exclusive: both may be on, and a listener on one tunes a client on the other,
+//! which `tests/native_tls.rs` checks in both directions. With neither feature everything
+//! here still compiles except the two backends, which is what a caller bringing a library of
+//! its own builds against.
 
 #![forbid(unsafe_code)]
 
+pub mod backend;
 mod error;
 mod implicit;
+#[cfg(feature = "native-tls")]
+pub mod native;
+#[cfg(feature = "rustls")]
+mod rustls_backend;
 
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 use vortice::{
     BoxedTransport, Config, Connection, ErrorReply, Greeting, Handler, HandlerFuture, Message,
     Profile, Responder, SessionId, Start, code,
 };
 
+use crate::backend::{Acceptor, Connector};
+
+pub use backend::Handshake;
 pub use error::{Error, Result};
-pub use implicit::{
-    BEEP_ALPN, accept, acceptor, connect, connect_over, looks_like_tls, serve, with_client_alpn,
+pub use implicit::{BEEP_ALPN, accept, connect, connect_over, looks_like_tls, serve};
+#[cfg(feature = "rustls")]
+pub use rustls_backend::{
+    acceptor, client_config, insecure_client_config, server_config, with_client_alpn,
     with_server_alpn,
 };
 
@@ -116,7 +139,7 @@ const PROCEED: &str = "<proceed />";
 pub async fn upgrade<'a>(
     session: &'a mut Connection,
     after: Config,
-    tls: ClientConfig,
+    tls: impl Connector,
     server_name: &str,
 ) -> Result<&'a Greeting> {
     if !session.peer_greeting().advertises(PROFILE_URI) {
@@ -138,20 +161,16 @@ pub async fn upgrade<'a>(
         }
     }
 
-    let name = ServerName::try_from(server_name)
-        .map_err(|_| Error::Certificate(format!("{server_name:?} is not a valid server name")))?
-        .to_owned();
-    let connector = TlsConnector::from(Arc::new(tls));
-
     // The swap reports failures as transport errors, which would reach the caller as a session
     // that merely ended. A refused certificate is a different thing to be told, and the most
     // likely failure here, so it is kept aside and reported as itself.
     let handshake_failure: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
     let failure = Arc::clone(&handshake_failure);
+    let name = server_name.to_owned();
 
     let outcome = session
         .upgrade(after, move |io| async move {
-            match connector.connect(name, io).await {
+            match tls.connect(&name, io).await {
                 Ok(stream) => Ok(Box::pin(stream) as BoxedTransport),
                 Err(error) => {
                     let message = error.to_string();
@@ -181,7 +200,7 @@ pub async fn upgrade<'a>(
 /// the two — see that method for why the gap matters.
 #[derive(Clone)]
 pub struct TlsProfile {
-    acceptor: TlsAcceptor,
+    acceptor: Arc<dyn Acceptor>,
     after: Config,
     policy: Arc<dyn TlsPolicy>,
 }
@@ -246,14 +265,36 @@ impl TlsProfile {
     /// Serves TLS with `tls`, and runs the session that follows with `after`.
     ///
     /// Tunes with anyone who asks; see [`TlsProfile::with_policy`] for a listener that does
-    /// not.
+    /// not, and [`TlsProfile::with_acceptor`] for one terminating TLS with something other
+    /// than rustls.
+    #[cfg(feature = "rustls")]
     #[must_use]
-    pub fn new(tls: ServerConfig, after: Config) -> Self {
+    pub fn new(tls: tokio_rustls::rustls::ServerConfig, after: Config) -> Self {
+        Self::with_acceptor(crate::acceptor(tls)).after_tuning(after)
+    }
+
+    /// A profile tuning with a backend of the caller's choosing.
+    ///
+    /// Any [`Acceptor`] will do: the rustls one, the `native-tls` one, or something written
+    /// for a TLS library this crate has never heard of. The profile itself is the negotiation
+    /// and the swap, neither of which knows what encrypts the transport afterwards.
+    #[must_use]
+    pub fn with_acceptor(acceptor: impl Acceptor) -> Self {
         Self {
-            acceptor: TlsAcceptor::from(Arc::new(tls)),
-            after,
+            acceptor: Arc::new(acceptor),
+            after: Config::new(vortice::Role::Listener),
             policy: Arc::new(AcceptAll),
         }
+    }
+
+    /// The configuration the session that follows the swap runs with.
+    ///
+    /// A fresh greeting means a fresh offer of profiles, so this is where a listener says what
+    /// it is willing to serve once the transport is encrypted.
+    #[must_use]
+    pub fn after_tuning(mut self, after: Config) -> Self {
+        self.after = after;
+        self
     }
 
     /// Puts a [`TlsPolicy`] in charge of who gets tuned.
@@ -300,7 +341,7 @@ impl Handler for TlsProfile {
     }
 
     fn on_open(&self, responder: Responder) -> HandlerFuture {
-        let acceptor = self.acceptor.clone();
+        let acceptor = Arc::clone(&self.acceptor);
         let after = self.after.clone();
         let policy = Arc::clone(&self.policy);
         Box::pin(async move {
@@ -313,8 +354,7 @@ impl Handler for TlsProfile {
             let outcome = if policy.proceed(session, server_name).await {
                 responder
                     .upgrade(after, move |io| async move {
-                        let stream = acceptor.accept(io).await.map_err(vortice::Error::Io)?;
-                        Ok(Box::pin(stream) as BoxedTransport)
+                        acceptor.accept(io).await.map_err(vortice::Error::Io)
                     })
                     .await
             } else {
@@ -333,144 +373,5 @@ impl Handler for TlsProfile {
                 tracing::debug!(%error, "TLS negotiation failed");
             }
         })
-    }
-}
-
-/// Builds a server configuration from PEM certificates and a PEM private key.
-///
-/// # Errors
-///
-/// Returns [`Error::Certificate`] if either cannot be parsed, or if they do not go together.
-pub fn server_config(certificates: &[u8], key: &[u8]) -> Result<ServerConfig> {
-    let chain = read_certificates(certificates)?;
-    let key = read_key(key)?;
-
-    ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(chain, key)
-        .map_err(|error| {
-            Error::Certificate(format!("certificate and key do not go together: {error}"))
-        })
-}
-
-/// Builds a client configuration trusting the given PEM certificates and nothing else.
-///
-/// # Errors
-///
-/// Returns [`Error::Certificate`] if they cannot be parsed.
-pub fn client_config(roots: &[u8]) -> Result<ClientConfig> {
-    let mut store = RootCertStore::empty();
-    for certificate in read_certificates(roots)? {
-        store
-            .add(certificate)
-            .map_err(|error| Error::Certificate(format!("not a usable root: {error}")))?;
-    }
-    Ok(ClientConfig::builder()
-        .with_root_certificates(store)
-        .with_no_client_auth())
-}
-
-/// Reads a PEM certificate chain.
-fn read_certificates(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
-    let mut reader = io::BufReader::new(pem);
-    let chain: std::result::Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    let chain =
-        chain.map_err(|error| Error::Certificate(format!("unreadable certificate: {error}")))?;
-    if chain.is_empty() {
-        return Err(Error::Certificate(
-            "no certificate found in the PEM given".to_owned(),
-        ));
-    }
-    Ok(chain)
-}
-
-/// Reads a PEM private key in any of the encodings rustls accepts.
-fn read_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
-    let mut reader = io::BufReader::new(pem);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|error| Error::Certificate(format!("unreadable private key: {error}")))?
-        .ok_or_else(|| Error::Certificate("no private key found in the PEM given".to_owned()))
-}
-
-/// A client configuration that accepts any certificate, for tests and for interoperating.
-///
-/// **This authenticates nothing.** It exists because it is what a great deal of deployed BEEP
-/// does — LibVortex verifies no certificate unless asked to, and its regression suite is built
-/// on a self-signed one — and because refusing to provide it would only push people to write a
-/// worse version. Encryption without authentication still stops passive interception; it does
-/// not stop anyone who can sit in the middle. Use [`client_config`] with the roots you expect
-/// wherever that matters.
-#[must_use]
-pub fn insecure_client_config() -> ClientConfig {
-    let mut config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(danger::AcceptAnyCertificate))
-        .with_no_client_auth();
-    config.enable_sni = true;
-    config
-}
-
-mod danger {
-    //! The certificate verifier behind [`super::insecure_client_config`], kept in a module of
-    //! its own so that what it does is impossible to import by accident.
-
-    use tokio_rustls::rustls::client::danger::{
-        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-    };
-    use tokio_rustls::rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
-    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use tokio_rustls::rustls::{DigitallySignedStruct, Error, SignatureScheme};
-
-    /// Accepts every certificate presented, without checking anything at all.
-    #[derive(Debug)]
-    pub(super) struct AcceptAnyCertificate;
-
-    impl ServerCertVerifier for AcceptAnyCertificate {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, Error> {
-            verify_tls12_signature(
-                message,
-                cert,
-                dss,
-                &tokio_rustls::rustls::crypto::ring::default_provider()
-                    .signature_verification_algorithms,
-            )
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, Error> {
-            verify_tls13_signature(
-                message,
-                cert,
-                dss,
-                &tokio_rustls::rustls::crypto::ring::default_provider()
-                    .signature_verification_algorithms,
-            )
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            tokio_rustls::rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms
-                .supported_schemes()
-        }
     }
 }

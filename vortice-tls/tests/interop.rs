@@ -39,6 +39,50 @@ use tls_policy::RegressionTlsPolicy;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_c_client_tunes_a_vortice_listener_for_tls() {
+    let tests = [
+        "test_05",
+        "test_05a",
+        "test_05a1",
+        "test_05a2",
+        "test_05b",
+        "test_05c",
+        "test_05d",
+    ];
+    run_against(100, &tests, |certificate, key, after| {
+        let tls = vortice_tls::server_config(certificate, key).expect("server configuration");
+        TlsProfile::new(tls, after)
+    })
+    .await;
+}
+
+/// The same negotiation with the platform's TLS underneath, to show the conformance belongs
+/// to the profile rather than to rustls.
+///
+/// Only `test_05` of the family: what the backend can affect is the handshake and the record
+/// layer, which that one exercises in full — tune, greet again, then a battery of requests and
+/// replies across the encrypted transport. The rest of the family is about refusing, stalling
+/// and reading state back, none of which goes anywhere near the TLS library.
+#[cfg(feature = "native-tls")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_c_client_tunes_a_native_tls_vortice_listener() {
+    run_against(150, &["test_05"], |certificate, key, after| {
+        let acceptor =
+            vortice_tls::native::acceptor(certificate, key).expect("native-tls acceptor");
+        TlsProfile::with_acceptor(acceptor).after_tuning(after)
+    })
+    .await;
+}
+
+/// Runs the named tests against a Vortice listener whose TLS profile `build` produces.
+///
+/// `offset` shifts this run's ports clear of the other interop tests: cargo runs the test
+/// binaries of different crates at the same time, and two listeners racing for one port makes
+/// both runs meaningless rather than one of them fail.
+async fn run_against(
+    offset: u16,
+    tests: &[&str],
+    build: impl FnOnce(&[u8], &[u8], Config) -> TlsProfile,
+) {
     // Only one interop test may drive the suite at a time, whichever crate it lives in:
     // three C clients moving tens of megabytes at once make the suite's own timing-sensitive
     // tests fail. Held for the whole test.
@@ -59,10 +103,7 @@ async fn the_c_client_tunes_a_vortice_listener_for_tls() {
         }
     };
 
-    // Shifted clear of the plain-TCP interop test, which binds the same base port: cargo runs
-    // the test binaries of different crates at the same time, and two listeners racing for one
-    // port makes both runs meaningless rather than one of them fail.
-    let suite = suite.clone().with_port_offset(suite.port_offset() + 100);
+    let suite = suite.clone().with_port_offset(suite.port_offset() + offset);
 
     let port = suite.listener_port();
     assert!(
@@ -75,8 +116,6 @@ async fn the_c_client_tunes_a_vortice_listener_for_tls() {
         .expect("the suite ships test-certificate.pem");
     let key = std::fs::read(suite.test_dir().join("test-private-key.pem"))
         .expect("the suite ships test-private-key.pem");
-    let tls = vortice_tls::server_config(&certificate, &key).expect("server configuration");
-
     // The /5 profile serves files the client names, relative to the working directory.
     std::env::set_current_dir(suite.test_dir()).expect("the suite directory should exist");
 
@@ -94,7 +133,7 @@ async fn the_c_client_tunes_a_vortice_listener_for_tls() {
 
     let router: Router = regression_router().profile(
         PROFILE_URI,
-        TlsProfile::new(tls, after).with_policy(RegressionTlsPolicy::default()),
+        build(&certificate, &key, after).with_policy(RegressionTlsPolicy::default()),
     );
 
     let server = Server::bind_with(("0.0.0.0", port), Config::new(Role::Listener), router)
@@ -110,18 +149,13 @@ async fn the_c_client_tunes_a_vortice_listener_for_tls() {
     // connection, what name it sees. Answering needs the session to have kept it across the
     // swap — the channel that named it is the one that asked for TLS, and both are gone by
     // the time the question arrives.
-    let tests = [
-        "test_05",
-        "test_05a",
-        "test_05a1",
-        "test_05a2",
-        "test_05b",
-        "test_05c",
-        "test_05d",
-    ];
+    let names: Vec<String> = tests.iter().map(|name| (*name).to_owned()).collect();
     let run = tokio::time::timeout(
         Duration::from_secs(300),
-        tokio::task::spawn_blocking(move || suite.run_client(&tests)),
+        tokio::task::spawn_blocking(move || {
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            suite.run_client(&names)
+        }),
     )
     .await
     .expect("the regression client should finish")
@@ -130,7 +164,7 @@ async fn the_c_client_tunes_a_vortice_listener_for_tls() {
 
     serving.abort();
 
-    if let Err(error) = run.check(&tests) {
+    if let Err(error) = run.check(tests) {
         panic!("the C client did not accept the Vortice listener under TLS: {error}");
     }
 }

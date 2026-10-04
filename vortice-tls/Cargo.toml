@@ -1,6 +1,6 @@
 [package]
 name = "vortice-tls"
-description = "The BEEP TLS profile (RFC3080 §3.1) for Vortice, over rustls"
+description = "The BEEP TLS profile (RFC3080 §3.1) for Vortice, over rustls or native-tls"
 keywords = ["beep", "rfc3080", "tls", "rustls"]
 categories = ["network-programming", "cryptography"]
 version.workspace = true
@@ -11,10 +11,20 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = ["rustls"]
+# The two backends are not exclusive: both may be on, and the profile works with either. With
+# neither, everything but the two backend implementations still compiles, which is what a
+# caller bringing its own TLS library builds against.
+rustls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+native-tls = ["dep:tokio-native-tls", "dep:native-tls"]
+
 [dependencies]
-rustls-pemfile = "2.2"
+native-tls = { version = "0.2", features = ["alpn", "alpn-accept"], optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
 tokio = { version = "1", features = ["io-util", "net", "rt"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+tokio-native-tls = { version = "0.3", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
 tracing = "0.1"
 vortice = { path = "../vortice", version = "0.0.0" }
 

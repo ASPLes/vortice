@@ -14,16 +14,12 @@
 //! anyone planned it or not. Nothing here is BEEP-specific: the session simply starts on a
 //! transport that happens to be encrypted, which is [`Connection::from_io`]'s whole point.
 
-use std::sync::Arc;
-
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, ServerConfig};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 use vortice::{Config, Connection, Router};
 
-use crate::error::{Error, Result};
+use crate::backend::{Acceptor, Connector};
+use crate::error::Result;
 
 /// Whether these octets look like the start of a TLS connection.
 ///
@@ -53,12 +49,12 @@ pub fn looks_like_tls(prefix: &[u8]) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Handshake`] if TLS fails and [`Error::Session`] if the greeting exchange
+/// Returns [`Error::Handshake`](crate::Error::Handshake) if TLS fails and [`Error::Session`](crate::Error::Session) if the greeting exchange
 /// does.
 pub async fn connect(
     address: impl ToSocketAddrs,
     server_name: &str,
-    tls: ClientConfig,
+    tls: impl Connector,
     config: Config,
 ) -> Result<Connection> {
     let stream = TcpStream::connect(address).await?;
@@ -74,17 +70,13 @@ pub async fn connect(
 pub async fn connect_over<T>(
     io: T,
     server_name: &str,
-    tls: ClientConfig,
+    tls: impl Connector,
     config: Config,
 ) -> Result<Connection>
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let name = ServerName::try_from(server_name)
-        .map_err(|_| Error::Certificate(format!("{server_name:?} is not a valid server name")))?
-        .to_owned();
-
-    let stream = TlsConnector::from(Arc::new(tls)).connect(name, io).await?;
+    let stream = tls.connect(server_name, Box::pin(io)).await?;
     Ok(Connection::from_io(stream, config).await?)
 }
 
@@ -95,14 +87,14 @@ where
 /// As [`connect`].
 pub async fn accept<T>(
     io: T,
-    tls: &TlsAcceptor,
+    tls: &impl Acceptor,
     config: Config,
     router: Router,
 ) -> Result<Connection>
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let stream = tls.accept(io).await?;
+    let stream = tls.accept(Box::pin(io)).await?;
     Ok(Connection::serve_io(stream, config, router).await?)
 }
 
@@ -111,7 +103,7 @@ where
 /// # Errors
 ///
 /// As [`connect`].
-pub async fn serve<T>(io: T, tls: &TlsAcceptor, config: Config, router: Router) -> Result<()>
+pub async fn serve<T>(io: T, tls: &impl Acceptor, config: Config, router: Router) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
@@ -119,40 +111,6 @@ where
     // Holding the handle is what keeps the session alive: dropping it would close it.
     connection.closed().await;
     Ok(())
-}
-
-/// An acceptor for `tls`, to be shared across connections.
-#[must_use]
-pub fn acceptor(tls: ServerConfig) -> TlsAcceptor {
-    TlsAcceptor::from(Arc::new(tls))
-}
-
-/// The protocol names offered by a client configuration, for ALPN.
-///
-/// ALPN is how one TLS port carries more than one protocol: the client lists what it speaks,
-/// the server picks, and the choice is available before a single application octet is read.
-/// That makes it the tidiest of the port-sharing mechanisms — no sniffing, no upgrade round
-/// trip — at the cost of requiring TLS, since there is nowhere else to put the list.
-///
-/// [`BEEP_ALPN`] is the name this project uses. Nothing registers it with IANA, so both ends
-/// have to agree, exactly as with the `Upgrade` token.
-pub fn with_client_alpn(mut tls: ClientConfig, protocols: &[&str]) -> ClientConfig {
-    tls.alpn_protocols = protocols
-        .iter()
-        .map(|protocol| protocol.as_bytes().to_vec())
-        .collect();
-    tls
-}
-
-/// The protocol names a server will accept, in order of preference.
-///
-/// See [`with_client_alpn`].
-pub fn with_server_alpn(mut tls: ServerConfig, protocols: &[&str]) -> ServerConfig {
-    tls.alpn_protocols = protocols
-        .iter()
-        .map(|protocol| protocol.as_bytes().to_vec())
-        .collect();
-    tls
 }
 
 /// The ALPN name this project uses for BEEP directly inside TLS.
