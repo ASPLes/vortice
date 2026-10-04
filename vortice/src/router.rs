@@ -273,6 +273,42 @@ impl Responder {
         self.session
     }
 
+    /// Records who the peer authenticated as, for a profile that has just proved it.
+    ///
+    /// This is what a SASL profile calls when an exchange completes, and it is the only way
+    /// an identity gets onto a session:
+    /// [`Connection::authenticated`](crate::Connection::authenticated) reports what was set
+    /// here. Nothing checks the claim — the profile that made it is the one that verified it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] when the session is gone.
+    pub async fn authenticate(&self, identity: impl Into<String>) -> Result<()> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Authenticate {
+                identity: identity.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        answer.await.map_err(|_| Error::Closed)
+    }
+
+    /// Who the peer authenticated as, if a SASL exchange has succeeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] when the session is gone.
+    pub async fn authenticated(&self) -> Result<Option<String>> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Authenticated { reply })
+            .await
+            .map_err(|_| Error::Closed)?;
+        answer.await.map_err(|_| Error::Closed)
+    }
+
     /// The virtual host the peer named when it opened the session, if it named one.
     ///
     /// The same value [`Connection::server_name`](crate::Connection::server_name) reports: a

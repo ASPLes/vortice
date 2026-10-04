@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Advanced Software Production Line, S.L.
 // SPDX-License-Identifier: LGPL-2.1-only
 
-//! The two primitives the WebSocket handshake needs.
+//! The two primitives the WebSocket handshake needs: SHA-1, and the Base64 that
+//! [`vortice_proto`] provides.
 //!
 //! Neither is a security primitive here. RFC6455 §1.3 is explicit that the
 //! `Sec-WebSocket-Key` exchange proves nothing about the peer: it exists so that a caching
@@ -12,36 +13,14 @@
 //! dependency is acceptable — the usual objection to hand-written hashing does not apply to
 //! a value with no secret in it and no integrity claim on it.
 //!
-//! Both are checked against the vectors published in the RFCs.
+//! Both are checked against the vectors published in the RFCs — SHA-1 below, Base64 where it
+//! is defined.
 
-/// The Base64 alphabet of RFC4648 §4.
-const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Encodes `data` as Base64 with padding.
-pub(crate) fn base64(data: &[u8]) -> String {
-    let mut encoded = String::with_capacity(data.len().div_ceil(3) * 4);
-
-    for chunk in data.chunks(3) {
-        let bits = (u32::from(chunk[0]) << 16)
-            | (u32::from(chunk.get(1).copied().unwrap_or(0)) << 8)
-            | u32::from(chunk.get(2).copied().unwrap_or(0));
-
-        encoded.push(char::from(ALPHABET[(bits >> 18) as usize & 0x3f]));
-        encoded.push(char::from(ALPHABET[(bits >> 12) as usize & 0x3f]));
-        encoded.push(if chunk.len() > 1 {
-            char::from(ALPHABET[(bits >> 6) as usize & 0x3f])
-        } else {
-            '='
-        });
-        encoded.push(if chunk.len() > 2 {
-            char::from(ALPHABET[bits as usize & 0x3f])
-        } else {
-            '='
-        });
-    }
-
-    encoded
-}
+/// Base64, re-exported so that the two bindings that need it share one implementation.
+///
+/// It lives in `vortice-proto` because the SASL profiles need it too; see
+/// [`vortice_proto::base64`].
+pub(crate) use vortice_proto::base64::encode as base64;
 
 /// The SHA-1 digest of `message`, as specified in RFC3174.
 pub(crate) fn sha1(message: &[u8]) -> [u8; 20] {

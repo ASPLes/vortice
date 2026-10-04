@@ -90,6 +90,13 @@ pub(crate) enum Command {
     ServerName {
         reply: oneshot::Sender<Option<String>>,
     },
+    Authenticated {
+        reply: oneshot::Sender<Option<String>>,
+    },
+    Authenticate {
+        identity: String,
+        reply: oneshot::Sender<()>,
+    },
     SetWindowSize {
         channel: u32,
         size: u32,
@@ -290,6 +297,24 @@ impl Connection {
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(Command::ServerName { reply })
+            .await
+            .map_err(|_| Error::Closed)?;
+        answer.await.map_err(|_| Error::Closed)
+    }
+
+    /// Who the peer authenticated as, if a SASL exchange has succeeded.
+    ///
+    /// The authentication identity, not the authorization identity: who the peer proved
+    /// itself to be. See [`vortice_proto::session::Session::authenticated`] for why it does
+    /// not survive a transport swap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] when the session is gone.
+    pub async fn authenticated(&self) -> Result<Option<String>> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Authenticated { reply })
             .await
             .map_err(|_| Error::Closed)?;
         answer.await.map_err(|_| Error::Closed)
@@ -692,6 +717,13 @@ impl Driver {
             }
             Command::ServerName { reply } => {
                 let _ = reply.send(self.session.server_name().map(ToOwned::to_owned));
+            }
+            Command::Authenticated { reply } => {
+                let _ = reply.send(self.session.authenticated().map(ToOwned::to_owned));
+            }
+            Command::Authenticate { identity, reply } => {
+                self.session.set_authenticated(identity);
+                let _ = reply.send(());
             }
             Command::SetWindowSize {
                 channel,

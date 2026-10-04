@@ -246,6 +246,8 @@ pub struct Session {
     unacked: BTreeMap<u32, u32>,
     /// The virtual host this session is for, from the first `<start>` that named one.
     server_name: Option<String>,
+    /// Who the peer authenticated as, once a SASL profile says so.
+    authenticated: Option<String>,
 
     next_channel: u32,
     outbound: BytesMut,
@@ -272,6 +274,7 @@ impl Session {
             half_open: BTreeMap::new(),
             unacked: BTreeMap::new(),
             server_name: None,
+            authenticated: None,
             outbound: BytesMut::new(),
             events: VecDeque::new(),
         };
@@ -363,6 +366,28 @@ impl Session {
     #[must_use]
     pub fn server_name(&self) -> Option<&str> {
         self.server_name.as_deref()
+    }
+
+    /// Who the peer authenticated as, if a SASL exchange has succeeded.
+    ///
+    /// This is `vortex_connection_get_sasl_auth_id`, and it is the authentication identity —
+    /// who the peer proved itself to be — not the authorization identity it may have asked to
+    /// act as. A profile sets it with [`Session::set_authenticated`] and nothing else writes
+    /// it.
+    #[must_use]
+    pub fn authenticated(&self) -> Option<&str> {
+        self.authenticated.as_deref()
+    }
+
+    /// Records who the peer authenticated as.
+    ///
+    /// For a SASL profile to call when an exchange completes. Deliberately not carried into
+    /// the session that replaces this one after tuning, unlike the virtual host: RFC3080 §3.1
+    /// discards what was learnt in the clear, and an identity proved before the transport was
+    /// encrypted is exactly the kind of thing it means. Authenticate again afterwards, which
+    /// is the order the specification recommends anyway — TLS first, then SASL.
+    pub fn set_authenticated(&mut self, identity: impl Into<String>) {
+        self.authenticated = Some(identity.into());
     }
 
     /// Carries the virtual host into a session that replaces this one.

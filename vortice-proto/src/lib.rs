@@ -45,6 +45,7 @@
 
 extern crate alloc;
 
+pub mod base64;
 pub mod channel;
 pub mod codec;
 pub mod error;
