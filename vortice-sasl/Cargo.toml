@@ -1,0 +1,33 @@
+[package]
+name = "vortice-sasl"
+description = "The BEEP SASL profiles (RFC3080 §4.1) for Vortice, in pure Rust"
+keywords = ["beep", "rfc3080", "sasl", "authentication"]
+categories = ["network-programming", "authentication"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+# Every mechanism is a feature of its own, so that a deployment offers what it has decided to
+# offer and links nothing else. The default is the set that needs no shared secret in reach of
+# the listener.
+default = ["anonymous", "external", "plain"]
+anonymous = []
+external = []
+plain = []
+
+[dependencies]
+bytes = { workspace = true, features = ["std"] }
+tracing = "0.1"
+vortice = { path = "../vortice", version = "0.0.0" }
+vortice-proto = { path = "../vortice-proto", version = "0.0.0" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
