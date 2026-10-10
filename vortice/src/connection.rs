@@ -765,7 +765,11 @@ impl Driver {
             );
             return;
         };
-        match handler.accept(self.id, &uri, start) {
+        let peer = crate::router::Peer {
+            session: self.id,
+            server_name: self.session.server_name(),
+        };
+        match handler.accept(peer, &uri, start) {
             Ok(profile) => {
                 if self.session.accept_start(channel, msgno, profile).is_ok() {
                     self.awaiting_upgrade |= handler.upgrades_transport();

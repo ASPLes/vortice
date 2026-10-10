@@ -41,6 +41,28 @@ use crate::error::{Error, Result};
 /// What a handler returns: a task the session will drive to completion.
 pub type HandlerFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// What the driver knows about the peer asking for a channel, beyond the `<start>` itself.
+///
+/// Passed to [`Handler::accept`], which is synchronous and so cannot ask the session
+/// anything: whatever a profile needs in order to decide has to arrive with the request.
+#[derive(Debug, Clone, Copy)]
+pub struct Peer<'a> {
+    /// Which connection is asking.
+    ///
+    /// The same identity [`Responder::session`] reports, and stable across a transport swap,
+    /// since tuning replaces the session and not the connection. A profile keeping state per
+    /// peer keys on it.
+    pub session: SessionId,
+    /// The virtual host the peer named, if it named one.
+    ///
+    /// RFC3080 §2.3.1.2 makes `serverName` a property of the session, decided by the first
+    /// `<start>` that carries one — so this is that one, not necessarily the start in hand. A
+    /// profile serving several names needs it at exactly this moment: which host is being
+    /// asked for can decide whether the channel is granted at all, and for SASL it can decide
+    /// which set of credentials applies.
+    pub server_name: Option<&'a str>,
+}
+
 /// Serves one profile.
 ///
 /// Implemented for any `Fn(Responder, Message) -> Future`, which is the form the examples
@@ -66,20 +88,16 @@ pub trait Handler: Send + Sync + 'static {
     /// The default accepts, echoing the URI back with no piggybacked content. Returning an
     /// error refuses the channel with that code and text.
     ///
-    /// `session` names the connection asking, which is what a profile keeping state per peer
-    /// needs — the same identity [`Responder::session`] reports, and stable across a
-    /// transport swap, since tuning replaces the session and not the connection.
-    ///
     /// # Errors
     ///
     /// Whatever the profile wants the peer to be told.
     fn accept(
         &self,
-        session: SessionId,
+        peer: Peer<'_>,
         uri: &str,
         start: &Start,
     ) -> std::result::Result<Profile, ErrorReply> {
-        let _ = (session, start);
+        let _ = (peer, start);
         Ok(Profile::new(uri))
     }
 
@@ -154,7 +172,7 @@ impl Handler for AlwaysRefuse {
 
     fn accept(
         &self,
-        _session: SessionId,
+        _peer: Peer<'_>,
         _uri: &str,
         _start: &Start,
     ) -> std::result::Result<Profile, ErrorReply> {

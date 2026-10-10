@@ -283,7 +283,7 @@ impl Handler for PiggybackUpgrade {
 
     fn accept(
         &self,
-        _session: vortice::SessionId,
+        _peer: vortice::Peer<'_>,
         uri: &str,
         _start: &Start,
     ) -> Result<Profile, vortice::ErrorReply> {

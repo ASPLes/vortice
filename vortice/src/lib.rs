@@ -51,7 +51,7 @@ pub use channel::{Channel, Message, Reply};
 pub use connection::{BoxedTransport, Connection, SessionId, Transport};
 pub use error::{Error, Result};
 pub use rewind::Rewind;
-pub use router::{AlwaysRefuse, Handler, HandlerFuture, Responder, Router};
+pub use router::{AlwaysRefuse, Handler, HandlerFuture, Peer, Responder, Router};
 pub use server::Server;
 
 pub use vortice_proto::frame::FrameKind;
