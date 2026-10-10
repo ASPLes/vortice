@@ -22,6 +22,18 @@ pub enum Step {
     Continue(Vec<u8>),
     /// The peer is who it says it is.
     Complete(Identity),
+    /// The peer is who it says it is, and has something to be told while being told so.
+    ///
+    /// RFC3080 §4.1 allows the blob that carries `status='complete'` to carry data as well,
+    /// and `SCRAM` needs it: its last server message is a signature the peer checks to
+    /// satisfy itself that the listener also knew the credentials. Without this the exchange
+    /// would need a round that says nothing.
+    CompleteWith {
+        /// Who the peer turned out to be.
+        identity: Identity,
+        /// What goes out with the acceptance.
+        data: Vec<u8>,
+    },
     /// It is not, or the exchange is malformed. The text is for the log and for the
     /// `<error>` sent back, so it must say nothing a peer could learn from — see
     /// [`Self::Failed`]'s note.
@@ -75,6 +87,19 @@ impl Identity {
     }
 }
 
+/// What the listener knows about a peer before the exchange starts.
+///
+/// Handed to [`Mechanism::begin`] and from there to every [`Authenticator`] question, because
+/// the answer can depend on it: a listener serving several virtual hosts has a different set
+/// of users for each, which is what the `serverName` of RFC3080 §2.3.1.2 is for. The suite's
+/// `test_06a` is exactly this — one listener that accepts a password only when the session
+/// named a particular host.
+#[derive(Debug, Clone, Default)]
+pub struct Context {
+    /// The virtual host the peer named when it opened the session, if it named one.
+    pub server_name: Option<String>,
+}
+
 /// One mechanism a listener offers.
 pub trait Mechanism: Debug + Send + Sync + 'static {
     /// The name IANA registered, which is also the last part of the profile URI: `PLAIN`,
@@ -82,7 +107,7 @@ pub trait Mechanism: Debug + Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     /// Begins a conversation with one peer.
-    fn begin(&self) -> Box<dyn Exchange>;
+    fn begin(&self, context: Context) -> Box<dyn Exchange>;
 }
 
 /// One conversation with one peer.
@@ -110,8 +135,8 @@ pub trait Authenticator: Debug + Send + Sync + 'static {
     /// Whether to admit an unauthenticated peer offering `token` as a trace (RFC4505).
     ///
     /// The token is advisory and unverified — an email address by convention, nothing more.
-    fn anonymous(&self, token: &str) -> bool {
-        let _ = token;
+    fn anonymous(&self, context: &Context, token: &str) -> bool {
+        let _ = (context, token);
         false
     }
 
@@ -122,28 +147,48 @@ pub trait Authenticator: Debug + Send + Sync + 'static {
     /// and the only honest listener implementation consults what TLS, or the operating
     /// system behind a Unix socket, reported. `None` means the peer asked for whatever
     /// identity the transport says it has.
-    fn external(&self, authorization_id: Option<&str>) -> bool {
-        let _ = authorization_id;
+    fn external(&self, context: &Context, authorization_id: Option<&str>) -> bool {
+        let _ = (context, authorization_id);
         false
     }
 
     /// Whether `password` authenticates `authentication_id` (RFC4616).
     fn plain(
         &self,
+        context: &Context,
         authentication_id: &str,
         authorization_id: Option<&str>,
         password: &str,
     ) -> bool {
-        let _ = (authentication_id, authorization_id, password);
+        let _ = (context, authentication_id, authorization_id, password);
         false
     }
 
     /// The shared secret for an identity, for the mechanisms that must compute with it.
     ///
     /// Returning `Some` here is a statement that the listener holds recoverable passwords.
-    /// Nothing else in this crate asks for one.
-    fn secret(&self, authentication_id: &str, realm: Option<&str>) -> Option<String> {
-        let _ = (authentication_id, realm);
+    /// `CRAM-MD5` and `DIGEST-MD5` ask for one; nothing else in this crate does.
+    fn secret(
+        &self,
+        context: &Context,
+        authentication_id: &str,
+        realm: Option<&str>,
+    ) -> Option<String> {
+        let _ = (context, authentication_id, realm);
+        None
+    }
+
+    /// What is stored for an identity under `SCRAM`, which is not its password.
+    ///
+    /// A salt, an iteration count and two derived keys —
+    /// [`ScramCredentials::derive`](crate::ScramCredentials::derive) produces them where the
+    /// password is chosen, and the password is not needed afterwards. That this is a
+    /// different question from [`Authenticator::secret`] is the point: a listener can serve
+    /// `SCRAM` without being able to recover anyone's password, and cannot serve `CRAM-MD5`
+    /// that way.
+    #[cfg(feature = "scram-sha-256")]
+    fn scram(&self, context: &Context, authentication_id: &str) -> Option<crate::ScramCredentials> {
+        let _ = (context, authentication_id);
         None
     }
 }

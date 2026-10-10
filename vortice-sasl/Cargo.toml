@@ -19,9 +19,18 @@ default = ["anonymous", "external", "plain"]
 anonymous = []
 external = []
 plain = []
+cram-md5 = ["dep:md-5", "dep:hmac", "dep:getrandom", "dep:subtle"]
+digest-md5 = ["dep:md-5", "dep:hmac", "dep:getrandom", "dep:subtle"]
+scram-sha-256 = ["dep:sha2", "dep:hmac", "dep:pbkdf2", "dep:getrandom", "dep:subtle"]
 
 [dependencies]
 bytes = { workspace = true, features = ["std"] }
+getrandom = { version = "0.3", optional = true }
+hmac = { version = "0.13", optional = true }
+md-5 = { version = "0.11", optional = true }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
+sha2 = { version = "0.11", optional = true }
+subtle = { version = "2.6", optional = true }
 tracing = "0.1"
 vortice = { path = "../vortice", version = "0.0.0" }
 vortice-proto = { path = "../vortice-proto", version = "0.0.0" }
@@ -30,4 +39,9 @@ vortice-proto = { path = "../vortice-proto", version = "0.0.0" }
 workspace = true
 
 [dev-dependencies]
+hmac = "0.13"
+md-5 = "0.11"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+sha2 = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+vortice-interop = { path = "../vortice-interop" }

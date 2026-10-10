@@ -25,11 +25,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use vortice::{
-    ErrorReply, Handler, HandlerFuture, Message, Profile, Responder, SessionId, Start, code,
+    ErrorReply, Handler, HandlerFuture, Message, Peer, Profile, Responder, SessionId, Start, code,
 };
 
 use crate::blob::{Blob, Status};
-use crate::mechanism::{Exchange, Identity, Mechanism, Step};
+use crate::mechanism::{Context, Exchange, Identity, Mechanism, Step};
 
 /// The family every SASL profile URI belongs to.
 pub const PROFILE_FAMILY: &str = "http://iana.org/beep/SASL/";
@@ -128,20 +128,56 @@ fn refusal(text: &str) -> ErrorReply {
     ErrorReply::new(code::AUTHENTICATION_FAILURE).with_text(text.to_owned(), None)
 }
 
+/// The payload of an `ERR` that ends an exchange already under way.
+///
+/// It has to be an `<error>` element, and that is not a stylistic choice: LibVortex's client
+/// decides whether a round failed by looking at the first six octets of the payload for
+/// `<error` (`__vortex_sasl_is_error_content` in `sasl/vortex_sasl.c`). Anything else — a
+/// `<blob status='abort' />`, which is what the symmetry suggests — is read as a blob it
+/// cannot make sense of, and the client neither reports the failure nor closes the channel.
+/// `test_06` catches exactly that, by counting the channels left open after a failed
+/// authentication.
+fn error_payload(text: &str) -> String {
+    format!(
+        "<error code='{}'>{}</error>",
+        code::AUTHENTICATION_FAILURE,
+        escape(text)
+    )
+}
+
+/// The five characters XML will not take raw.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\'', "&apos;")
+        .replace('"', "&quot;")
+}
+
 impl Handler for SaslProfile {
     fn accept(
         &self,
-        session: SessionId,
+        peer: Peer<'_>,
         uri: &str,
         start: &Start,
     ) -> std::result::Result<Profile, ErrorReply> {
         let initial = initial_blob(uri, start)?;
-        let mut exchange = self.mechanism.begin();
+        // The virtual host comes from the session rather than from this start: RFC3080
+        // §2.3.1.2 has the first channel decide it for the whole session, and a SASL channel
+        // is not always the first.
+        let context = Context {
+            server_name: peer.server_name.map(ToOwned::to_owned),
+        };
+        let mut exchange = self.mechanism.begin(context);
 
         let (state, content) = match exchange.step(&initial) {
             Step::Complete(identity) => (
                 State::Settled(identity),
                 Blob::status(Status::Complete).to_xml(),
+            ),
+            Step::CompleteWith { identity, data } => (
+                State::Settled(identity),
+                Blob::with_status(Status::Complete, data).to_xml(),
             ),
             Step::Continue(challenge) => (
                 State::InFlight(exchange),
@@ -160,7 +196,7 @@ impl Handler for SaslProfile {
         self.exchanges
             .lock()
             .expect("the exchange table is not poisoned")
-            .insert((session, start.number), state);
+            .insert((peer.session, start.number), state);
         Ok(Profile::new(uri).with_content(content))
     }
 
@@ -205,14 +241,14 @@ impl Handler for SaslProfile {
             // a profile that is not expecting any.
             let Some(State::InFlight(mut exchange)) = in_flight else {
                 let _ = responder
-                    .error(message.msgno, Blob::status(Status::Abort).to_xml())
+                    .error(message.msgno, error_payload("no exchange is in progress"))
                     .await;
                 return;
             };
 
             let Ok(blob) = Blob::from_xml(&String::from_utf8_lossy(&message.payload)) else {
                 let _ = responder
-                    .error(message.msgno, Blob::status(Status::Abort).to_xml())
+                    .error(message.msgno, error_payload("not a SASL blob"))
                     .await;
                 return;
             };
@@ -232,6 +268,15 @@ impl Handler for SaslProfile {
                         .reply(message.msgno, Blob::status(Status::Complete).to_xml())
                         .await;
                 }
+                Step::CompleteWith { identity, data } => {
+                    let _ = responder.authenticate(identity.effective()).await;
+                    let _ = responder
+                        .reply(
+                            message.msgno,
+                            Blob::with_status(Status::Complete, data).to_xml(),
+                        )
+                        .await;
+                }
                 Step::Continue(challenge) => {
                     exchanges
                         .lock()
@@ -246,9 +291,7 @@ impl Handler for SaslProfile {
                 }
                 Step::Failed(reason) => {
                     tracing::debug!(mechanism = name, %reason, "SASL exchange refused");
-                    let _ = responder
-                        .error(message.msgno, Blob::status(Status::Abort).to_xml())
-                        .await;
+                    let _ = responder.error(message.msgno, error_payload(&reason)).await;
                 }
             }
         })

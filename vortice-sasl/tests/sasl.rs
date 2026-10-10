@@ -13,12 +13,15 @@ use std::time::Duration;
 
 use vortice::{Config, Connection, Message, Profile, Responder, Role, Router, Server};
 use vortice_sasl::{
-    Anonymous, Authenticator, Blob, External, Plain, SaslProfile, Status, profile_uri,
+    Anonymous, Authenticator, Blob, Context, External, Plain, SaslProfile, Status, profile_uri,
 };
 
 /// Answers with whoever the session authenticated as, which is the only way to see from the
 /// wire that the identity was recorded.
 const WHOAMI: &str = "urn:example:whoami";
+
+/// The virtual host that has a different user than the default one.
+const VIRTUAL_HOST: &str = "test_06a.server";
 
 async fn within<F: Future>(future: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(20), future)
@@ -32,16 +35,50 @@ async fn within<F: Future>(future: F) -> F::Output {
 struct Suite;
 
 impl Authenticator for Suite {
-    fn anonymous(&self, token: &str) -> bool {
+    fn anonymous(&self, _context: &Context, token: &str) -> bool {
         token == "test@aspl.es"
     }
 
-    fn external(&self, authorization_id: Option<&str>) -> bool {
+    fn external(&self, _context: &Context, authorization_id: Option<&str>) -> bool {
         authorization_id == Some("acinom")
     }
 
-    fn plain(&self, authentication_id: &str, _acting_as: Option<&str>, password: &str) -> bool {
+    fn plain(
+        &self,
+        context: &Context,
+        authentication_id: &str,
+        _acting_as: Option<&str>,
+        password: &str,
+    ) -> bool {
+        // One listener, two sets of users, chosen by the virtual host the session named.
+        // This is `test_06a`'s shape, and the reason the context reaches here at all.
+        if context.server_name.as_deref() == Some(VIRTUAL_HOST) {
+            return authentication_id == "12345" && password == "12345";
+        }
         authentication_id == "bob" && password == "secret"
+    }
+
+    fn secret(
+        &self,
+        _context: &Context,
+        authentication_id: &str,
+        _realm: Option<&str>,
+    ) -> Option<String> {
+        (authentication_id == "bob").then(|| "secret".to_owned())
+    }
+
+    /// The same user, stored the way `SCRAM` wants it: a salt, a count and two derived keys,
+    /// with the password nowhere in sight. A real listener derives this once, where the
+    /// password is chosen, and keeps only the result.
+    #[cfg(feature = "scram-sha-256")]
+    fn scram(
+        &self,
+        _context: &Context,
+        authentication_id: &str,
+    ) -> Option<vortice_sasl::ScramCredentials> {
+        (authentication_id == "bob").then(|| {
+            vortice_sasl::ScramCredentials::derive("secret", b"a fixed salt, for the test", 4096)
+        })
     }
 }
 
@@ -73,11 +110,30 @@ async fn start() -> String {
             SaslProfile::new(Plain::new(Arc::clone(&users))),
         );
 
+    #[cfg(feature = "cram-md5")]
+    let router = router.profile(
+        profile_uri("CRAM-MD5"),
+        SaslProfile::new(vortice_sasl::CramMd5::new(
+            Arc::clone(&users),
+            "beep.example.net",
+        )),
+    );
+
+    #[cfg(feature = "scram-sha-256")]
+    let router = router.profile(
+        profile_uri("SCRAM-SHA-256"),
+        SaslProfile::new(vortice_sasl::ScramSha256::new(Arc::clone(&users))),
+    );
+
     let config = Config::new(Role::Listener)
         .with_profile(WHOAMI)
         .with_profile(profile_uri("ANONYMOUS"))
         .with_profile(profile_uri("EXTERNAL"))
         .with_profile(profile_uri("PLAIN"));
+    #[cfg(feature = "cram-md5")]
+    let config = config.with_profile(profile_uri("CRAM-MD5"));
+    #[cfg(feature = "scram-sha-256")]
+    let config = config.with_profile(profile_uri("SCRAM-SHA-256"));
 
     let server = Server::bind_with("127.0.0.1:0", config, router)
         .await
@@ -218,5 +274,147 @@ async fn content_that_is_not_a_blob_is_refused() {
         "expected the channel to be refused, got {outcome:?}"
     );
 
+    within(session.close()).await.expect("close");
+}
+
+/// The multi-round path: the listener speaks first, the peer answers, and the verdict comes
+/// on the open channel rather than on the acceptance. Everything above finishes in one round,
+/// so without this the `Continue` branch of the profile is never exercised.
+#[cfg(feature = "cram-md5")]
+#[tokio::test]
+async fn cram_md5_takes_two_rounds_and_authenticates() {
+    use hmac::{Hmac, KeyInit, Mac};
+    use md5::Md5;
+
+    let address = start().await;
+    let session = within(Connection::connect(
+        address.as_str(),
+        Config::new(Role::Initiator),
+    ))
+    .await
+    .expect("connect");
+
+    // Nothing is piggybacked: this mechanism has the listener go first.
+    let channel = within(session.open_channel(Profile::new(profile_uri("CRAM-MD5"))))
+        .await
+        .expect("the listener should accept the channel and challenge");
+
+    let offered = channel.profile().content.clone().unwrap_or_default();
+    let challenge = Blob::from_xml(&offered).expect("a blob carrying the challenge");
+    assert_eq!(challenge.status, Status::Continue);
+    assert!(
+        !challenge.data.is_empty(),
+        "the challenge is what the response is keyed over"
+    );
+
+    let mut mac = Hmac::<Md5>::new_from_slice(b"secret").expect("any key length");
+    mac.update(&challenge.data);
+    let digest = mac.finalize().into_bytes();
+    let response = format!(
+        "bob {}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+
+    let reply = within(channel.request(Blob::new(response.into_bytes()).to_xml()))
+        .await
+        .expect("the second round");
+    assert_eq!(
+        String::from_utf8_lossy(reply.payload()),
+        Blob::status(Status::Complete).to_xml()
+    );
+
+    assert_eq!(whoami(&session).await, "bob");
+    within(session.close()).await.expect("close");
+}
+
+/// `SCRAM` completes *and* says something in the same blob, which is the one profile path
+/// nothing else here takes: `<blob status='complete'>` with content. The content is the
+/// server signature, and a peer that does not check it has thrown away half of what this
+/// mechanism offers over `CRAM-MD5`.
+#[cfg(feature = "scram-sha-256")]
+#[tokio::test]
+async fn scram_completes_carrying_the_server_signature() {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::{Digest, Sha256};
+    use vortice_proto::base64;
+
+    /// HMAC-SHA-256, the peer's half of the arithmetic.
+    fn mac(key: &[u8], message: &[u8]) -> [u8; 32] {
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("any key length");
+        mac.update(message);
+        mac.finalize().into_bytes().into()
+    }
+
+    let address = start().await;
+    let session = within(Connection::connect(
+        address.as_str(),
+        Config::new(Role::Initiator),
+    ))
+    .await
+    .expect("connect");
+
+    // `n,,` is the GS2 header: no channel binding, no authorization identity.
+    let bare = "n=bob,r=peer-nonce";
+    let channel = within(
+        session.open_channel(
+            Profile::new(profile_uri("SCRAM-SHA-256"))
+                .with_content(Blob::new(format!("n,,{bare}").into_bytes()).to_xml()),
+        ),
+    )
+    .await
+    .expect("the listener should accept the channel and answer");
+
+    let first = Blob::from_xml(&channel.profile().content.clone().unwrap_or_default())
+        .expect("a blob carrying the first server message");
+    assert_eq!(first.status, Status::Continue);
+    let server_first = String::from_utf8(first.data).expect("text");
+
+    let field = |name: &str| -> String {
+        server_first
+            .split(',')
+            .find_map(|part| part.strip_prefix(&format!("{name}=")))
+            .expect("the attribute is there")
+            .to_owned()
+    };
+    let salt = base64::decode(&field("s")).expect("the salt comes back");
+    let nonce = field("r");
+    assert!(nonce.starts_with("peer-nonce"), "it extends ours: {nonce}");
+
+    let final_bare = format!("c=biws,r={nonce}");
+    let message = format!("{bare},{server_first},{final_bare}");
+
+    let mut salted = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(b"secret", &salt, 4096, &mut salted);
+    let client_key = mac(&salted, b"Client Key");
+    let stored_key: [u8; 32] = Sha256::digest(client_key).into();
+    let signature = mac(&stored_key, message.as_bytes());
+    let mut proof = [0u8; 32];
+    for (at, octet) in proof.iter_mut().enumerate() {
+        *octet = client_key[at] ^ signature[at];
+    }
+
+    let sent = format!("{final_bare},p={}", base64::encode(&proof));
+    let reply = within(channel.request(Blob::new(sent.into_bytes()).to_xml()))
+        .await
+        .expect("the second round");
+
+    let last = Blob::from_xml(&String::from_utf8_lossy(reply.payload()))
+        .expect("a blob carrying the signature");
+    assert_eq!(last.status, Status::Complete);
+
+    let server_key = mac(&salted, b"Server Key");
+    assert_eq!(
+        String::from_utf8(last.data).expect("text"),
+        format!(
+            "v={}",
+            base64::encode(&mac(&server_key, message.as_bytes()))
+        ),
+        "the listener has to prove it holds the credentials too"
+    );
+
+    assert_eq!(whoami(&session).await, "bob");
     within(session.close()).await.expect("close");
 }

@@ -12,13 +12,19 @@
 //! ```no_run
 //! # use std::sync::Arc;
 //! use vortice::{Config, Role, Router, Server};
-//! use vortice_sasl::{Authenticator, Plain, SaslProfile, profile_uri};
+//! use vortice_sasl::{Authenticator, Context, Plain, SaslProfile, profile_uri};
 //!
 //! #[derive(Debug)]
 //! struct Users;
 //!
 //! impl Authenticator for Users {
-//!     fn plain(&self, user: &str, _acting_as: Option<&str>, password: &str) -> bool {
+//!     fn plain(
+//!         &self,
+//!         _context: &Context,
+//!         user: &str,
+//!         _acting_as: Option<&str>,
+//!         password: &str,
+//!     ) -> bool {
 //!         user == "bob" && password == "secret"
 //!     }
 //! }
@@ -66,17 +72,38 @@
 //! | `external` | [`External`] | RFC4422 §A. The transport already said who this is |
 //! | `plain` | [`Plain`] | RFC4616. Needs a confidential transport under it |
 //!
+//! And one that asks more of the listener, so it is not in the default set:
+//!
+//! | Feature | Mechanism | |
+//! |---|---|---|
+//! | `cram-md5` | [`CramMd5`] | RFC2195. Two rounds, and the listener must hold recoverable passwords |
+//! | `digest-md5` | [`DigestMd5`] | RFC2831, **withdrawn by RFC6331**. Three rounds. For the peers that still speak it |
+//!
+//! And the one to reach for:
+//!
+//! | Feature | Mechanism | |
+//! |---|---|---|
+//! | `scram-sha-256` | [`ScramSha256`] | RFC7677. Salted, iterated, no recoverable password stored, and the listener proves itself too |
+//!
 //! Pure Rust throughout: GNU SASL is what LibVortex uses and is not a dependency here.
 
 #![forbid(unsafe_code)]
 
 pub mod blob;
+#[cfg(feature = "cram-md5")]
+mod cram_md5;
+#[cfg(feature = "digest-md5")]
+mod digest_md5;
 mod mechanism;
+/// The one-round mechanisms share a module, and it is of no use without one of them.
+#[cfg(any(feature = "anonymous", feature = "external", feature = "plain"))]
 mod mechanisms;
 mod profile;
+#[cfg(feature = "scram-sha-256")]
+mod scram;
 
 pub use blob::{Blob, Status};
-pub use mechanism::{Authenticator, Exchange, Identity, Mechanism, Step};
+pub use mechanism::{Authenticator, Context, Exchange, Identity, Mechanism, Step};
 pub use profile::{PROFILE_FAMILY, SaslProfile, profile_uri};
 
 #[cfg(feature = "anonymous")]
@@ -85,3 +112,10 @@ pub use mechanisms::Anonymous;
 pub use mechanisms::External;
 #[cfg(feature = "plain")]
 pub use mechanisms::Plain;
+
+#[cfg(feature = "cram-md5")]
+pub use cram_md5::CramMd5;
+#[cfg(feature = "digest-md5")]
+pub use digest_md5::DigestMd5;
+#[cfg(feature = "scram-sha-256")]
+pub use scram::{ScramCredentials, ScramSha256};

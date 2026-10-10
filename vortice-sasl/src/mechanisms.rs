@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use crate::mechanism::{Authenticator, Exchange, Identity, Mechanism, Step};
+use crate::mechanism::{Authenticator, Context, Exchange, Identity, Mechanism, Step};
 
 /// `ANONYMOUS`, RFC4505: no credential, an optional trace token.
 ///
@@ -38,9 +38,10 @@ impl Mechanism for Anonymous {
         "ANONYMOUS"
     }
 
-    fn begin(&self) -> Box<dyn Exchange> {
+    fn begin(&self, context: Context) -> Box<dyn Exchange> {
         Box::new(AnonymousExchange {
             authenticator: Arc::clone(&self.authenticator),
+            context,
         })
     }
 }
@@ -48,6 +49,7 @@ impl Mechanism for Anonymous {
 #[cfg(feature = "anonymous")]
 struct AnonymousExchange {
     authenticator: Arc<dyn Authenticator>,
+    context: Context,
 }
 
 #[cfg(feature = "anonymous")]
@@ -57,7 +59,7 @@ impl Exchange for AnonymousExchange {
         let Ok(token) = std::str::from_utf8(blob) else {
             return Step::denied();
         };
-        if self.authenticator.anonymous(token) {
+        if self.authenticator.anonymous(&self.context, token) {
             Step::Complete(Identity::new(token))
         } else {
             Step::denied()
@@ -93,9 +95,10 @@ impl Mechanism for External {
         "EXTERNAL"
     }
 
-    fn begin(&self) -> Box<dyn Exchange> {
+    fn begin(&self, context: Context) -> Box<dyn Exchange> {
         Box::new(ExternalExchange {
             authenticator: Arc::clone(&self.authenticator),
+            context,
         })
     }
 }
@@ -103,6 +106,7 @@ impl Mechanism for External {
 #[cfg(feature = "external")]
 struct ExternalExchange {
     authenticator: Arc<dyn Authenticator>,
+    context: Context,
 }
 
 #[cfg(feature = "external")]
@@ -113,7 +117,7 @@ impl Exchange for ExternalExchange {
         };
         let asked_for = (!authorization_id.is_empty()).then_some(authorization_id);
 
-        if self.authenticator.external(asked_for) {
+        if self.authenticator.external(&self.context, asked_for) {
             Step::Complete(Identity {
                 // There is no authentication identity of its own: the transport's is the
                 // only one there is, and the listener knows it by other means.
@@ -154,9 +158,10 @@ impl Mechanism for Plain {
         "PLAIN"
     }
 
-    fn begin(&self) -> Box<dyn Exchange> {
+    fn begin(&self, context: Context) -> Box<dyn Exchange> {
         Box::new(PlainExchange {
             authenticator: Arc::clone(&self.authenticator),
+            context,
         })
     }
 }
@@ -164,6 +169,7 @@ impl Mechanism for Plain {
 #[cfg(feature = "plain")]
 struct PlainExchange {
     authenticator: Arc<dyn Authenticator>,
+    context: Context,
 }
 
 #[cfg(feature = "plain")]
@@ -190,7 +196,7 @@ impl Exchange for PlainExchange {
         let asked_for = (!authorization.is_empty()).then_some(authorization);
         if self
             .authenticator
-            .plain(authentication, asked_for, password)
+            .plain(&self.context, authentication, asked_for, password)
         {
             Step::Complete(Identity {
                 authentication_id: authentication.to_owned(),
@@ -213,15 +219,21 @@ mod tests {
     struct Suite;
 
     impl Authenticator for Suite {
-        fn anonymous(&self, token: &str) -> bool {
+        fn anonymous(&self, _context: &Context, token: &str) -> bool {
             token == "test@aspl.es"
         }
 
-        fn external(&self, authorization_id: Option<&str>) -> bool {
+        fn external(&self, _context: &Context, authorization_id: Option<&str>) -> bool {
             authorization_id == Some("acinom")
         }
 
-        fn plain(&self, authentication_id: &str, _: Option<&str>, password: &str) -> bool {
+        fn plain(
+            &self,
+            _context: &Context,
+            authentication_id: &str,
+            _: Option<&str>,
+            password: &str,
+        ) -> bool {
             authentication_id == "bob" && password == "secret"
         }
     }
@@ -230,15 +242,24 @@ mod tests {
         Arc::new(Suite)
     }
 
+    /// These mechanisms do not look at the context, so one shape serves every case here;
+    /// `test_06a`'s virtual host is exercised from `tests/sasl.rs`, where it matters.
+    fn exchange(mechanism: &dyn Mechanism) -> Box<dyn crate::mechanism::Exchange> {
+        mechanism.begin(Context::default())
+    }
+
     #[cfg(feature = "anonymous")]
     #[test]
     fn anonymous_admits_the_token_it_knows_and_no_other() {
         let mechanism = Anonymous::new(suite());
         assert_eq!(
-            mechanism.begin().step(b"test@aspl.es"),
+            exchange(&mechanism).step(b"test@aspl.es"),
             Step::Complete(Identity::new("test@aspl.es"))
         );
-        assert_eq!(mechanism.begin().step(b"test-fail@aspl.es"), Step::denied());
+        assert_eq!(
+            exchange(&mechanism).step(b"test-fail@aspl.es"),
+            Step::denied()
+        );
     }
 
     #[cfg(feature = "external")]
@@ -246,14 +267,14 @@ mod tests {
     fn external_admits_the_authorization_identity_it_knows() {
         let mechanism = External::new(suite());
         assert_eq!(
-            mechanism.begin().step(b"acinom"),
+            exchange(&mechanism).step(b"acinom"),
             Step::Complete(Identity {
                 authentication_id: "acinom".to_owned(),
                 authorization_id: Some("acinom".to_owned()),
             })
         );
-        assert_eq!(mechanism.begin().step(b"acinom1"), Step::denied());
-        assert_eq!(mechanism.begin().step(b""), Step::denied());
+        assert_eq!(exchange(&mechanism).step(b"acinom1"), Step::denied());
+        assert_eq!(exchange(&mechanism).step(b""), Step::denied());
     }
 
     #[cfg(feature = "plain")]
@@ -261,18 +282,21 @@ mod tests {
     fn plain_reads_the_three_fields_rfc4616_defines() {
         let mechanism = Plain::new(suite());
         assert_eq!(
-            mechanism.begin().step(b"\0bob\0secret"),
+            exchange(&mechanism).step(b"\0bob\0secret"),
             Step::Complete(Identity::new("bob"))
         );
         assert_eq!(
-            mechanism.begin().step(b"admin\0bob\0secret"),
+            exchange(&mechanism).step(b"admin\0bob\0secret"),
             Step::Complete(Identity {
                 authentication_id: "bob".to_owned(),
                 authorization_id: Some("admin".to_owned()),
             })
         );
-        assert_eq!(mechanism.begin().step(b"\0bob\0wrong"), Step::denied());
-        assert_eq!(mechanism.begin().step(b"\0alice\0secret"), Step::denied());
+        assert_eq!(exchange(&mechanism).step(b"\0bob\0wrong"), Step::denied());
+        assert_eq!(
+            exchange(&mechanism).step(b"\0alice\0secret"),
+            Step::denied()
+        );
     }
 
     /// A password cannot contain a NUL, so anything with more or fewer fields is malformed
@@ -287,7 +311,7 @@ mod tests {
             b"",
             b"\0bob\0secret\0",
         ] {
-            assert_eq!(mechanism.begin().step(bad), Step::denied(), "{bad:?}");
+            assert_eq!(exchange(&mechanism).step(bad), Step::denied(), "{bad:?}");
         }
     }
 }
