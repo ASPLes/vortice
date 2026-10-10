@@ -101,7 +101,7 @@ use std::sync::{Arc, Mutex};
 
 use vortice::{
     BoxedTransport, Config, Connection, ErrorReply, Greeting, Handler, HandlerFuture, Message,
-    Profile, Responder, SessionId, Start, code,
+    Peer, Profile, Responder, SessionId, Start, code,
 };
 
 use crate::backend::{Acceptor, Connector};
@@ -314,7 +314,7 @@ impl Handler for TlsProfile {
 
     fn accept(
         &self,
-        session: SessionId,
+        peer: Peer<'_>,
         uri: &str,
         start: &Start,
     ) -> std::result::Result<Profile, ErrorReply> {
@@ -332,7 +332,7 @@ impl Handler for TlsProfile {
                 None,
             ));
         }
-        self.policy.accept(session, start)?;
+        self.policy.accept(peer.session, start)?;
         Ok(Profile::new(uri).with_content(PROCEED))
     }
 

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use vortice::{
-    AlwaysRefuse, ErrorReply, Handler, HandlerFuture, Message, Profile, Responder, Router,
+    AlwaysRefuse, ErrorReply, Handler, HandlerFuture, Message, Peer, Profile, Responder, Router,
     SessionId, Start, code,
 };
 
@@ -352,12 +352,7 @@ impl Handler for BlockTls {
         Box::pin(std::future::ready(()))
     }
 
-    fn accept(
-        &self,
-        _session: SessionId,
-        uri: &str,
-        _start: &Start,
-    ) -> Result<Profile, ErrorReply> {
+    fn accept(&self, _peer: Peer<'_>, uri: &str, _start: &Start) -> Result<Profile, ErrorReply> {
         // At the start rather than once the channel is open, which is where the C listener
         // does it (`start_channel_block_tls`): the client sends the TLS start immediately
         // after this one and the flag has to be up by then.
